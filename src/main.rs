@@ -16,6 +16,7 @@ use commands::{
     renorm::{self as renorm_cmd, RenormConfig},
 };
 
+
 #[derive(Parser)]
 #[command(author, version, about)]
 struct Cli {
