@@ -26,10 +26,7 @@ impl Sample {
     }
 }
 
-pub fn parse_cami(path: &Path) -> Result<Vec<Sample>> {
-    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let reader = BufReader::new(file);
-
+pub fn parse_cami_reader<R: BufRead>(reader: R) -> Result<Vec<Sample>> {
     let mut samples = Vec::new();
     let mut current: Option<Sample> = None;
 
@@ -105,15 +102,24 @@ pub fn parse_cami(path: &Path) -> Result<Vec<Sample>> {
     if let Some(s) = current.take() {
         samples.push(s);
     }
-
     Ok(samples)
 }
 
+pub fn parse_cami(path: &Path) -> Result<Vec<Sample>> {
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let reader = BufReader::new(file);
+    parse_cami_reader(reader)
+}
+
 pub fn load_samples(input: Option<&PathBuf>) -> Result<Vec<Sample>> {
-    let path = input
-        .cloned()
-        .unwrap_or_else(|| PathBuf::from("examples/text.cami"));
-    parse_cami(&path)
+    match input {
+        Some(path) if path != Path::new("-") => parse_cami(path),
+        _ => {
+            let stdin = io::stdin();
+            let handle = stdin.lock();
+            parse_cami_reader(handle)
+        }
+    }
 }
 
 pub fn write_cami(samples: &[Sample], out: &mut dyn Write) -> Result<()> {
@@ -138,10 +144,9 @@ pub fn write_cami(samples: &[Sample], out: &mut dyn Write) -> Result<()> {
 }
 
 pub fn open_output(path: Option<&PathBuf>) -> Result<Box<dyn Write>> {
-    let writer: Box<dyn Write> = if let Some(p) = path {
-        Box::new(File::create(p)?)
-    } else {
-        Box::new(io::stdout())
+    let writer: Box<dyn Write> = match path {
+        Some(p) if p != Path::new("-") => Box::new(File::create(p)?),
+        _ => Box::new(io::stdout()),
     };
     Ok(writer)
 }
