@@ -29,6 +29,14 @@ pub fn renormalize(samples: &mut [Sample]) {
     }
 }
 
+pub fn round_percentages(samples: &mut [Sample]) {
+    for sample in samples.iter_mut() {
+        for entry in &mut sample.entries {
+            entry.percentage = (entry.percentage * 100000.0).round() / 100000.0;
+        }
+    }
+}
+
 pub fn fill_up_to(
     samples: &mut [Sample],
     from_rank: Option<&str>,
