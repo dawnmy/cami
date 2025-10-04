@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 use commands::{
+    benchmark::{self as benchmark_cmd, BenchmarkConfig as BenchmarkRunConfig},
     fillup::{self as fillup_cmd, FillupConfig},
     filter::{self as filter_cmd, FilterConfig},
     list::{self as list_cmd, ListConfig},
@@ -30,8 +31,81 @@ struct Cli {
     command: Commands,
 }
 
+fn split_labels(input: &str) -> Vec<String> {
+    input
+        .split(',')
+        .map(|part| part.trim().to_string())
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+fn split_ranks(input: &str) -> Vec<String> {
+    input
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .map(|part| part.trim().to_string())
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
 #[derive(Subcommand)]
 enum Commands {
+    #[command(
+        about = "Benchmark predicted profiles against a ground truth",
+        long_about = "Compare predicted CAMI abundance tables to a ground truth profile per sample and rank. Reports TP/FP/FN counts, precision (purity), recall (completeness), F1-score, Jaccard index, L1 error, Bray-Curtis distance, Shannon diversity, equitability, Pearson and Spearman correlations, plus weighted and unweighted UniFrac differences."
+    )]
+    Benchmark {
+        #[arg(
+            short = 'g',
+            long = "ground-truth",
+            value_name = "FILE",
+            help = "Ground truth CAMI profile to evaluate against."
+        )]
+        ground_truth: PathBuf,
+        #[arg(
+            value_name = "PREDICTED",
+            num_args = 1..,
+            help = "Predicted CAMI profiles to benchmark."
+        )]
+        predictions: Vec<PathBuf>,
+        #[arg(
+            short = 'l',
+            long = "labels",
+            value_name = "LABELS",
+            help = "Comma-separated labels for the predicted profiles."
+        )]
+        labels: Option<String>,
+        #[arg(
+            long = "gmin",
+            value_name = "MIN",
+            help = "Ignore ground truth taxa below this abundance percentage."
+        )]
+        gmin: Option<f64>,
+        #[arg(
+            short = 'n',
+            long = "normalize",
+            help = "Normalize abundances within each sample/rank to 100 before scoring."
+        )]
+        normalize: bool,
+        #[arg(
+            long = "by-domain",
+            help = "Also write domain-specific reports for Bacteria, Archaea, Eukarya, and Viruses."
+        )]
+        by_domain: bool,
+        #[arg(
+            short = 'o',
+            long = "output",
+            value_name = "DIR",
+            help = "Directory where benchmark TSV reports will be written."
+        )]
+        output: PathBuf,
+        #[arg(
+            short = 'r',
+            long = "ranks",
+            value_name = "RANKS",
+            help = "Comma-separated list of ranks to evaluate (mix short and full names)."
+        )]
+        ranks: Option<String>,
+    },
     #[command(
         about = "Filter CAMI profiling data with logical expressions",
         long_about = "Apply boolean filter expressions to CAMI profiling tables. Combine rank, sample, abundance, taxonomy, and cumulative-sum predicates with & (and), | (or), and parentheses. When --fill-up is provided the command completes missing lineages using the NCBI taxdump before writing a filtered CAMI table."
@@ -184,6 +258,30 @@ enum Commands {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match &cli.command {
+        Commands::Benchmark {
+            ground_truth,
+            predictions,
+            labels,
+            gmin,
+            normalize,
+            by_domain,
+            output,
+            ranks,
+        } => {
+            let label_vec = labels.as_ref().map(|s| split_labels(s)).unwrap_or_default();
+            let rank_vec = ranks.as_ref().map(|s| split_ranks(s));
+            let cfg = BenchmarkRunConfig {
+                ground_truth: ground_truth.clone(),
+                predictions: predictions.clone(),
+                labels: label_vec,
+                gmin: *gmin,
+                normalize: *normalize,
+                by_domain: *by_domain,
+                output: output.clone(),
+                ranks: rank_vec,
+            };
+            benchmark_cmd::run(&cfg)
+        }
         Commands::Filter {
             expression,
             output,

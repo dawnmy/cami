@@ -1,3 +1,4 @@
+pub mod benchmark;
 pub mod fillup;
 pub mod filter;
 pub mod list;
