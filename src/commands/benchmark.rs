@@ -25,7 +25,6 @@ struct ProfileEntry {
     taxid: String,
     percentage: f64,
     taxpath: String,
-    taxpathsn: String,
 }
 
 pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
@@ -194,7 +193,6 @@ fn build_profile_map(
                     taxid: entry.taxid.clone(),
                     percentage: entry.percentage,
                     taxpath: entry.taxpath.clone(),
-                    taxpathsn: entry.taxpathsn.clone(),
                 });
         }
 
@@ -509,5 +507,5 @@ fn format_opt(value: Option<f64>) -> String {
 }
 
 fn format_float(value: f64) -> String {
-    format!("{:.6}", value)
+    format!("{:.5}", value)
 }
