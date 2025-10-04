@@ -9,6 +9,7 @@ pub struct FilterConfig<'a> {
     pub expression: &'a str,
     pub output: Option<&'a PathBuf>,
     pub fill_up: bool,
+    pub from_rank: Option<&'a str>,
     pub to_rank: &'a str,
     pub renorm: bool,
     pub input: Option<&'a PathBuf>,
@@ -33,7 +34,7 @@ pub fn run(cfg: &FilterConfig) -> Result<()> {
         let tax = taxonomy
             .as_ref()
             .ok_or_else(|| anyhow!("fill-up requires taxonomy data"))?;
-        fill_up_to(&mut filtered, cfg.to_rank, tax);
+        fill_up_to(&mut filtered, cfg.from_rank, cfg.to_rank, tax);
     }
     if cfg.renorm {
         renormalize(&mut filtered);

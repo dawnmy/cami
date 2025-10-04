@@ -29,7 +29,6 @@ pub fn run(cfg: &ListConfig) -> Result<()> {
         for rank in &sample.ranks {
             let (count, total) = stats.get(rank.as_str()).cloned().unwrap_or((0, 0.0));
             writeln!(out, "    {}: taxa={} total={:.3}", rank, count, total)?;
-
         }
     }
 

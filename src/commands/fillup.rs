@@ -8,6 +8,7 @@ pub struct FillupConfig<'a> {
     pub input: Option<&'a PathBuf>,
     pub output: Option<&'a PathBuf>,
     pub to_rank: Option<&'a str>,
+    pub from_rank: Option<&'a str>,
 }
 
 pub fn run(cfg: &FillupConfig) -> Result<()> {
@@ -17,9 +18,9 @@ pub fn run(cfg: &FillupConfig) -> Result<()> {
     let taxonomy = Taxonomy::load(&dir)?;
 
     if let Some(rank) = cfg.to_rank {
-        fill_up_to(&mut samples, rank, &taxonomy);
+        fill_up_to(&mut samples, cfg.from_rank, rank, &taxonomy);
     } else {
-        fill_up_default(&mut samples, &taxonomy);
+        fill_up_default(&mut samples, cfg.from_rank, &taxonomy);
     }
 
     let mut out = open_output(cfg.output)?;

@@ -28,7 +28,12 @@ pub fn renormalize(samples: &mut [Sample]) {
     }
 }
 
-pub fn fill_up_to(samples: &mut [Sample], to_rank: &str, taxonomy: &Taxonomy) {
+pub fn fill_up_to(
+    samples: &mut [Sample],
+    from_rank: Option<&str>,
+    to_rank: &str,
+    taxonomy: &Taxonomy,
+) {
     for sample in samples.iter_mut() {
         if sample.entries.is_empty() {
             continue;
@@ -36,6 +41,16 @@ pub fn fill_up_to(samples: &mut [Sample], to_rank: &str, taxonomy: &Taxonomy) {
         let Some(target_idx) = sample.rank_index(to_rank) else {
             continue;
         };
+        let Some(base_idx) = select_base_rank(sample, from_rank) else {
+            continue;
+        };
+        if base_idx < target_idx {
+            continue;
+        }
+
+        let start_idx = target_idx.min(base_idx);
+        let end_idx = target_idx.max(base_idx);
+
         let mut existing_by_key: HashMap<(usize, String), Entry> = HashMap::new();
         let mut existing_by_rank: HashMap<usize, Vec<String>> = HashMap::new();
         for entry in &sample.entries {
@@ -57,6 +72,9 @@ pub fn fill_up_to(samples: &mut [Sample], to_rank: &str, taxonomy: &Taxonomy) {
             let Some(entry_rank_idx) = sample.rank_index(&entry.rank) else {
                 continue;
             };
+            if entry_rank_idx != base_idx {
+                continue;
+            }
             let fallback_entry = existing_by_key.get(&(entry_rank_idx, entry.taxid.clone()));
             let Some(rank_map) = rank_map_for(sample, taxonomy, &entry.taxid, &mut cache, || {
                 fallback_entry.and_then(|e| fallback_rank_map(e, sample))
@@ -64,13 +82,16 @@ pub fn fill_up_to(samples: &mut [Sample], to_rank: &str, taxonomy: &Taxonomy) {
                 continue;
             };
 
-            let start = entry_rank_idx.min(target_idx);
-            let end = entry_rank_idx.max(target_idx);
-            for rank in &sample.ranks[start..=end] {
+            for rank_idx in start_idx..=end_idx {
+                if rank_idx == entry_rank_idx {
+                    continue;
+                }
+                let rank = &sample.ranks[rank_idx];
                 if let Some((tid, _name)) = rank_map.get(rank) {
-                    if let Some(idx) = sample.rank_index(rank) {
-                        *sums.entry((idx, tid.clone())).or_insert(0.0) += entry.percentage;
+                    if existing_by_key.contains_key(&(rank_idx, tid.clone())) {
+                        continue;
                     }
+                    *sums.entry((rank_idx, tid.clone())).or_insert(0.0) += entry.percentage;
                 }
             }
         }
@@ -126,15 +147,46 @@ pub fn fill_up_to(samples: &mut [Sample], to_rank: &str, taxonomy: &Taxonomy) {
     }
 }
 
-pub fn fill_up_default(samples: &mut [Sample], taxonomy: &Taxonomy) {
+pub fn fill_up_default(samples: &mut [Sample], from_rank: Option<&str>, taxonomy: &Taxonomy) {
     for sample in samples.iter_mut() {
         if sample.entries.is_empty() {
             continue;
         }
         if let Some(target_rank) = sample.ranks.first().cloned() {
-            fill_up_to(std::slice::from_mut(sample), &target_rank, taxonomy);
+            fill_up_to(
+                std::slice::from_mut(sample),
+                from_rank,
+                &target_rank,
+                taxonomy,
+            );
         }
     }
+}
+
+fn select_base_rank(sample: &Sample, from_rank: Option<&str>) -> Option<usize> {
+    if let Some(rank) = from_rank {
+        if let Some(idx) = sample.rank_index(rank) {
+            if has_entries_at(sample, &sample.ranks[idx]) {
+                return Some(idx);
+            }
+        }
+    }
+    if let Some(idx) = sample.rank_index("species") {
+        if has_entries_at(sample, &sample.ranks[idx]) {
+            return Some(idx);
+        }
+    }
+    sample
+        .ranks
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, rank)| has_entries_at(sample, rank))
+        .map(|(idx, _)| idx)
+}
+
+fn has_entries_at(sample: &Sample, rank: &str) -> bool {
+    sample.entries.iter().any(|e| e.rank == rank)
 }
 
 fn rank_map_for<'a, F>(
