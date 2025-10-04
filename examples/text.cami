@@ -1,0 +1,48 @@
+#mpa_vJun23_CHOCOPhlAnSGB_202403
+#2131775 reads processed
+@SampleID:s1
+@Version:0.10.0
+@Ranks:superkingdom|phylum|class|order|family|genus|species|strain
+@@TAXID	RANK	TAXPATH	TAXPATHSN	PERCENTAGE
+2	superkingdom	2	Bacteria	100.0
+201174	phylum	2|201174	Bacteria|Actinobacteria	65.67585
+1224	phylum	2|1224	Bacteria|Proteobacteria	34.32415
+1760	class	2|201174|1760	Bacteria|Actinobacteria|Actinomycetia	65.67585
+1236	class	2|1224|1236	Bacteria|Proteobacteria|Gammaproteobacteria	18.57719
+28211	class	2|1224|28211	Bacteria|Proteobacteria|Alphaproteobacteria	15.74697
+85009	order	2|201174|1760|85009	Bacteria|Actinobacteria|Actinomycetia|Propionibacteriales	65.67585
+72274	order	2|1224|1236|72274	Bacteria|Proteobacteria|Gammaproteobacteria|Pseudomonadales	18.57719
+204457	order	2|1224|28211|204457	Bacteria|Proteobacteria|Alphaproteobacteria|Sphingomonadales	15.74697
+31957	family	2|201174|1760|85009|31957	Bacteria|Actinobacteria|Actinomycetia|Propionibacteriales|Propionibacteriaceae	65.67585
+135621	family	2|1224|1236|72274|135621	Bacteria|Proteobacteria|Gammaproteobacteria|Pseudomonadales|Pseudomonadaceae	18.57719
+41297	family	2|1224|28211|204457|41297	Bacteria|Proteobacteria|Alphaproteobacteria|Sphingomonadales|Sphingomonadaceae	15.74697
+1912216	genus	2|201174|1760|85009|31957|1912216	Bacteria|Actinobacteria|Actinomycetia|Propionibacteriales|Propionibacteriaceae|Cutibacterium	65.67585
+286	genus	2|1224|1236|72274|135621|286	Bacteria|Proteobacteria|Gammaproteobacteria|Pseudomonadales|Pseudomonadaceae|Pseudomonas	18.57719
+13687	genus	2|1224|28211|204457|41297|13687	Bacteria|Proteobacteria|Alphaproteobacteria|Sphingomonadales|Sphingomonadaceae|Sphingomonas	15.74697
+1747	species	2|201174|1760|85009|31957|1912216|1747	Bacteria|Actinobacteria|Actinomycetia|Propionibacteriales|Propionibacteriaceae|Cutibacterium|Cutibacterium_acnes	65.67585
+515393	species	2|1224|1236|72274|135621|286|515393	Bacteria|Proteobacteria|Gammaproteobacteria|Pseudomonadales|Pseudomonadaceae|Pseudomonas|Pseudomonas_yamanorum	18.57719
+2502209	species	2|1224|28211|204457|41297|13687|2502209	Bacteria|Proteobacteria|Alphaproteobacteria|Sphingomonadales|Sphingomonadaceae|Sphingomonas|Sphingomonas_sp_3F27F9	15.74697
+# Taxonomic Profiling Output
+# git tag version 3.1.0 |  motus version 3.1.0 | map_tax 3.1.0 | gene database: nr3.1.0 | calc_mgc 3.1.0 -y insert.scaled_counts -l 75 | calc_motu 3.1.0 -k mOTU -C precision -g 3 | taxonomy: ref_mOTU_3.1.0 meta_mOTU_3.1.0
+
+@SampleID: s2
+@Version:0.9.3
+@Ranks:superkingdom|phylum|class|order|family|genus|species|strain
+@TaxonomyID: Jan 08 2019
+@@TAXID	RANK	TAXPATH	TAXPATHSN	PERCENTAGE
+2	superkingdom	2	Bacteria	100.0
+1224	phylum	2|1224	Bacteria|Proteobacteria	75.25769082667917
+201174	phylum	2|201174	Bacteria|Actinobacteria	24.74230917332083
+1236	class	2|1224|1236	Bacteria|Proteobacteria|Gammaproteobacteria	46.86575687291187
+1760	class	2|201174|1760	Bacteria|Actinobacteria|Actinobacteria	24.74230917332083
+28216	class	2|1224|28216	Bacteria|Proteobacteria|Betaproteobacteria	28.391933953767296
+72274	order	2|1224|1236|72274	Bacteria|Proteobacteria|Gammaproteobacteria|Pseudomonadales	46.86575687291187
+85009	order	2|201174|1760|85009	Bacteria|Actinobacteria|Actinobacteria|Propionibacteriales	24.74230917332083
+80840	order	2|1224|28216|80840	Bacteria|Proteobacteria|Betaproteobacteria|Burkholderiales	28.391933953767296
+135621	family	2|1224|1236|72274|135621	Bacteria|Proteobacteria|Gammaproteobacteria|Pseudomonadales|Pseudomonadaceae	46.86575687291187
+31957	family	2|201174|1760|85009|31957	Bacteria|Actinobacteria|Actinobacteria|Propionibacteriales|Propionibacteriaceae	24.74230917332083
+80864	family	2|1224|28216|80840|80864	Bacteria|Proteobacteria|Betaproteobacteria|Burkholderiales|Comamonadaceae	28.391933953767296
+286	genus	2|1224|1236|72274|135621|286	Bacteria|Proteobacteria|Gammaproteobacteria|Pseudomonadales|Pseudomonadaceae|Pseudomonas	46.86575687291187
+1912216	genus	2|201174|1760|85009|31957|1912216	Bacteria|Actinobacteria|Actinobacteria|Propionibacteriales|Propionibacteriaceae|Cutibacterium	24.74230917332083
+12916	genus	2|1224|28216|80840|80864|12916	Bacteria|Proteobacteria|Betaproteobacteria|Burkholderiales|Comamonadaceae|Acidovorax	28.391933953767296
+1747	species	2|201174|1760|85009|31957|1912216|1747	Bacteria|Actinobacteria|Actinobacteria|Propionibacteriales|Propionibacteriaceae|Cutibacterium|Cutibacterium acnes	100.0
