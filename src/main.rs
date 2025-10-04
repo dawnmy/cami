@@ -51,7 +51,7 @@ fn split_ranks(input: &str) -> Vec<String> {
 enum Commands {
     #[command(
         about = "Benchmark predicted profiles against a ground truth",
-        long_about = "Compare predicted CAMI abundance tables to a ground truth profile per sample and rank. Reports TP/FP/FN counts, precision (purity), recall (completeness), F1-score, Jaccard index, L1 error, Bray-Curtis distance, Shannon diversity, equitability, Pearson and Spearman correlations, plus weighted and unweighted UniFrac differences."
+        long_about = "Compare predicted CAMI abundance tables to a ground truth profile per sample and rank. Reports TP/FP/FN counts, precision (purity), recall (completeness), F1-score, Jaccard index, L1 error, Bray-Curtis distance, Shannon diversity, equitability, Pearson and Spearman correlations, weighted and unweighted UniFrac differences, and the Abundance Rank Error (ARE)."
     )]
     Benchmark {
         #[arg(
@@ -74,6 +74,13 @@ enum Commands {
             help = "Comma-separated labels for the predicted profiles."
         )]
         labels: Option<String>,
+        #[arg(
+            long = "af",
+            value_name = "EXPR",
+            help = "Filter expression applied to both ground truth and predicted profiles before scoring.",
+            long_help = "Expression syntax matches `cami filter`, combining rank (r), sample (s), abundance (a), taxonomy (t/tax), and cumulative-sum (c) predicates with & (and), | (or), and parentheses."
+        )]
+        all_filter: Option<String>,
         #[arg(
             long = "gf",
             value_name = "EXPR",
@@ -270,6 +277,7 @@ fn main() -> Result<()> {
             ground_truth,
             predictions,
             labels,
+            all_filter,
             ground_filter,
             pred_filter,
             normalize,
@@ -283,6 +291,7 @@ fn main() -> Result<()> {
                 ground_truth: ground_truth.clone(),
                 predictions: predictions.clone(),
                 labels: label_vec,
+                all_filter: all_filter.clone(),
                 ground_filter: ground_filter.clone(),
                 pred_filter: pred_filter.clone(),
                 normalize: *normalize,
