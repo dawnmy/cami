@@ -36,7 +36,6 @@ pub fn fill_up_to(samples: &mut [Sample], to_rank: &str, taxonomy: &Taxonomy) {
         let Some(target_idx) = sample.rank_index(to_rank) else {
             continue;
         };
-
         let mut existing_by_key: HashMap<(usize, String), Entry> = HashMap::new();
         let mut existing_by_rank: HashMap<usize, Vec<String>> = HashMap::new();
         for entry in &sample.entries {
@@ -123,7 +122,6 @@ pub fn fill_up_to(samples: &mut [Sample], to_rank: &str, taxonomy: &Taxonomy) {
                 });
             }
         }
-
         sample.entries = new_entries;
     }
 }
