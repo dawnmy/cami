@@ -16,7 +16,6 @@ use commands::{
     renorm::{self as renorm_cmd, RenormConfig},
 };
 
-
 #[derive(Parser)]
 #[command(author, version, about)]
 struct Cli {
@@ -36,6 +35,9 @@ enum Commands {
         /// Fill up missing higher ranks using NCBI taxdump (downloads to ~/.cami)
         #[arg(long)]
         fill_up: bool,
+        /// Source rank to aggregate from when filling up (defaults to species if present)
+        #[arg(long = "from")]
+        from_rank: Option<String>,
         /// Target rank to fill up to (inclusive)
         #[arg(long, default_value = "phylum")]
         to_rank: String,
@@ -81,6 +83,9 @@ enum Commands {
         /// Target rank to fill to (inclusive). Defaults to the highest declared rank
         #[arg(long)]
         to_rank: Option<String>,
+        /// Source rank to aggregate from when filling up (defaults to species if present)
+        #[arg(long = "from")]
+        from_rank: Option<String>,
     },
 }
 
@@ -91,6 +96,7 @@ fn main() -> Result<()> {
             expression,
             output,
             fill_up,
+            from_rank,
             to_rank,
             renorm,
             input,
@@ -99,6 +105,7 @@ fn main() -> Result<()> {
                 expression,
                 output: output.as_ref(),
                 fill_up: *fill_up,
+                from_rank: from_rank.as_deref(),
                 to_rank,
                 renorm: *renorm,
                 input: input.as_ref(),
@@ -129,11 +136,13 @@ fn main() -> Result<()> {
             input,
             output,
             to_rank,
+            from_rank,
         } => {
             let cfg = FillupConfig {
                 input: input.as_ref(),
                 output: output.as_ref(),
                 to_rank: to_rank.as_deref(),
+                from_rank: from_rank.as_deref(),
             };
             fillup_cmd::run(&cfg)
         }

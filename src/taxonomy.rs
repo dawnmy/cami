@@ -20,6 +20,7 @@ pub struct Taxonomy {
     nodes: HashMap<u32, TaxNode>,
     names: HashMap<u32, String>,
     ancestors: RwLock<HashMap<u32, Vec<u32>>>,
+    lineages: RwLock<HashMap<u32, Vec<(u32, String, String)>>>,
 }
 
 impl Taxonomy {
@@ -47,6 +48,7 @@ impl Taxonomy {
             nodes,
             names,
             ancestors: RwLock::new(HashMap::new()),
+            lineages: RwLock::new(HashMap::new()),
         })
     }
 
@@ -75,6 +77,9 @@ impl Taxonomy {
     }
 
     pub fn lineage(&self, taxid: u32) -> Vec<(u32, String, String)> {
+        if let Some(cached) = self.lineages.read().unwrap().get(&taxid) {
+            return cached.clone();
+        }
         let mut stack = Vec::new();
         let mut current = Some(taxid);
         let mut visited = HashSet::new();
@@ -83,11 +88,12 @@ impl Taxonomy {
                 break;
             }
             visited.insert(tid);
-            let rank = self
+            let rank_raw = self
                 .nodes
                 .get(&tid)
                 .map(|n| n.rank.clone())
                 .unwrap_or_else(|| "no_rank".to_string());
+            let rank = canonicalize_rank(&rank_raw);
             let name = self
                 .names
                 .get(&tid)
@@ -103,6 +109,7 @@ impl Taxonomy {
             });
         }
         stack.reverse();
+        self.lineages.write().unwrap().insert(taxid, stack.clone());
         stack
     }
 }
@@ -177,4 +184,11 @@ fn parse_names(path: &Path) -> Result<HashMap<u32, String>> {
 
 pub fn parse_taxid(taxid: &str) -> Option<u32> {
     taxid.parse().ok()
+}
+
+fn canonicalize_rank(rank: &str) -> String {
+    match rank {
+        "domain" => "superkingdom".to_string(),
+        other => other.to_string(),
+    }
 }
