@@ -1,13 +1,14 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
+use std::cmp::{max, min};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
 // std::io::Write not directly needed in this scope
+use flate2::read::GzDecoder;
 use reqwest::blocking::get;
 use std::fs;
-use flate2::read::GzDecoder;
 use tar::Archive;
 
 #[derive(Parser)]
@@ -73,13 +74,25 @@ struct Entry {
     percentage: f64,
 }
 
+#[derive(Debug, Clone)]
+struct TaxNode {
+    parent: String,
+    rank: String,
+}
+
+#[derive(Debug, Clone)]
+struct Taxonomy {
+    nodes: HashMap<String, TaxNode>,
+    names: HashMap<String, String>,
+    ancestors: HashMap<String, Vec<String>>,
+}
+
 fn parse_cami(path: &PathBuf) -> Result<Vec<Sample>> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let reader = BufReader::new(file);
 
     let mut samples = Vec::new();
     let mut current: Option<Sample> = None;
-
 
     for line in reader.lines() {
         let line = line?;
@@ -176,24 +189,42 @@ fn parse_expression(s: &str) -> Result<Expr> {
     let mut pos = 0;
 
     fn skip_ws(chars: &Vec<char>, pos: &mut usize) {
-        while *pos < chars.len() && chars[*pos].is_whitespace() { *pos += 1; }
+        while *pos < chars.len() && chars[*pos].is_whitespace() {
+            *pos += 1;
+        }
     }
 
     fn parse_primary(chars: &Vec<char>, pos: &mut usize) -> Result<Expr> {
         skip_ws(chars, pos);
-        if *pos >= chars.len() { return Err(anyhow::anyhow!("unexpected end")); }
+        if *pos >= chars.len() {
+            return Err(anyhow::anyhow!("unexpected end"));
+        }
         if chars[*pos] == '(' {
             *pos += 1;
             let e = parse_or(chars, pos)?;
             skip_ws(chars, pos);
-            if *pos < chars.len() && chars[*pos] == ')' { *pos += 1; Ok(e) } else { Err(anyhow::anyhow!("missing )")) }
+            if *pos < chars.len() && chars[*pos] == ')' {
+                *pos += 1;
+                Ok(e)
+            } else {
+                Err(anyhow::anyhow!("missing )"))
+            }
         } else {
             // read until whitespace or & or |
             let start = *pos;
-            while *pos < chars.len() && !chars[*pos].is_whitespace() && chars[*pos] != '&' && chars[*pos] != '|' && chars[*pos] != ')' {
+            while *pos < chars.len()
+                && !chars[*pos].is_whitespace()
+                && chars[*pos] != '&'
+                && chars[*pos] != '|'
+                && chars[*pos] != ')'
+            {
                 *pos += 1;
             }
-            let atom: String = chars[start..*pos].iter().collect::<String>().trim().to_string();
+            let atom: String = chars[start..*pos]
+                .iter()
+                .collect::<String>()
+                .trim()
+                .to_string();
             Ok(Expr::Atom(atom))
         }
     }
@@ -226,15 +257,35 @@ fn parse_expression(s: &str) -> Result<Expr> {
     Ok(e)
 }
 
-fn eval_expr(e: &Expr, samples: &Vec<Sample>, sample: &Sample, entry: &Entry, sample_index: usize, nodes: Option<&HashMap<String,(String,String)>>, names: Option<&HashMap<String,String>>, ancestors: Option<&HashMap<String,std::collections::HashSet<String>>>) -> bool {
+fn eval_expr(
+    e: &Expr,
+    samples: &Vec<Sample>,
+    sample: &Sample,
+    entry: &Entry,
+    sample_index: usize,
+    taxonomy: Option<&Taxonomy>,
+) -> bool {
     match e {
-        Expr::And(a, b) => eval_expr(a, samples, sample, entry, sample_index, nodes, names, ancestors) && eval_expr(b, samples, sample, entry, sample_index, nodes, names, ancestors),
-        Expr::Or(a, b) => eval_expr(a, samples, sample, entry, sample_index, nodes, names, ancestors) || eval_expr(b, samples, sample, entry, sample_index, nodes, names, ancestors),
-        Expr::Atom(s) => eval_atom(s, samples, sample, entry, sample_index, nodes, names, ancestors),
+        Expr::And(a, b) => {
+            eval_expr(a, samples, sample, entry, sample_index, taxonomy)
+                && eval_expr(b, samples, sample, entry, sample_index, taxonomy)
+        }
+        Expr::Or(a, b) => {
+            eval_expr(a, samples, sample, entry, sample_index, taxonomy)
+                || eval_expr(b, samples, sample, entry, sample_index, taxonomy)
+        }
+        Expr::Atom(s) => eval_atom(s, samples, sample, entry, sample_index, taxonomy),
     }
 }
 
-fn eval_atom(s: &str, _samples: &Vec<Sample>, sample: &Sample, entry: &Entry, sample_index: usize, nodes: Option<&HashMap<String,(String,String)>>, _names: Option<&HashMap<String,String>>, ancestors: Option<&HashMap<String,std::collections::HashSet<String>>>) -> bool {
+fn eval_atom(
+    s: &str,
+    samples: &Vec<Sample>,
+    sample: &Sample,
+    entry: &Entry,
+    sample_index: usize,
+    taxonomy: Option<&Taxonomy>,
+) -> bool {
     let s = s.trim();
     if s.starts_with("rank==") {
         let v = s[6..].trim();
@@ -280,37 +331,69 @@ fn eval_atom(s: &str, _samples: &Vec<Sample>, sample: &Sample, entry: &Entry, sa
     if s.starts_with("sample==") {
         let v = s[8..].trim();
         if v.contains(':') {
-            let parts: Vec<&str> = v.split(':').collect();
-            let a: usize = parts[0].parse().unwrap_or(1);
-            let b: usize = parts[1].parse().unwrap_or(a);
-            return (a..=b).contains(&(sample_index + 1));
+            let parts: Vec<&str> = v.split(':').map(|p| p.trim()).collect();
+            if parts.len() == 2 {
+                let start = parts[0];
+                let end = parts[1];
+                if let (Ok(sa), Ok(ea)) = (start.parse::<usize>(), end.parse::<usize>()) {
+                    let low = min(sa, ea);
+                    let high = max(sa, ea);
+                    return (low..=high).contains(&(sample_index + 1));
+                }
+                let mut start_idx: Option<usize> = None;
+                let mut end_idx: Option<usize> = None;
+                for (idx, smp) in samples.iter().enumerate() {
+                    if start_idx.is_none() && smp.id == start {
+                        start_idx = Some(idx);
+                    }
+                    if smp.id == end {
+                        end_idx = Some(idx);
+                    }
+                }
+                if let (Some(a), Some(b)) = (start_idx, end_idx) {
+                    let low = min(a, b);
+                    let high = max(a, b);
+                    return (low..=high).contains(&sample_index);
+                }
+            }
+            return false;
         }
         if v.contains(',') {
             let vals: Vec<&str> = v.split(',').map(|p| p.trim()).collect();
-            return vals.iter().any(|val| *val == sample.id || *val == (sample_index+1).to_string());
+            return vals.iter().any(|val| {
+                if let Ok(idx) = val.parse::<usize>() {
+                    idx == sample_index + 1
+                } else {
+                    *val == sample.id
+                }
+            });
         }
-        return v == sample.id || v == (sample_index+1).to_string();
+        return if let Ok(idx) = v.parse::<usize>() {
+            idx == sample_index + 1
+        } else {
+            v == sample.id
+        };
     }
 
     if s.starts_with("abundance") {
         if let Some(idx) = s.find("<=") {
-            let val: f64 = s[idx+2..].trim().parse().unwrap_or(0.0);
+            let val: f64 = s[idx + 2..].trim().parse().unwrap_or(0.0);
             return entry.percentage <= val;
         }
         if let Some(idx) = s.find(">=") {
-            let val: f64 = s[idx+2..].trim().parse().unwrap_or(0.0);
+            let val: f64 = s[idx + 2..].trim().parse().unwrap_or(0.0);
             return entry.percentage >= val;
         }
         if let Some(idx) = s.find("==") {
-            let val: f64 = s[idx+2..].trim().parse().unwrap_or(0.0);
+            let val: f64 = s[idx + 2..].trim().parse().unwrap_or(0.0);
             return (entry.percentage - val).abs() < 1e-9;
         }
         if let Some(idx) = s.find('>') {
-            let val: f64 = s[idx+1..].trim().parse().unwrap_or(0.0);
+            let val: f64 = s[idx + 1..].trim().parse().unwrap_or(0.0);
             return entry.percentage > val;
         }
         if let Some(idx) = s.find('<') {
-            let val: f64 = s[idx+1..].trim().parse().unwrap_or(0.0);
+            let val: f64 = s[idx + 1..].trim().parse().unwrap_or(0.0);
             return entry.percentage < val;
         }
     }
@@ -323,12 +406,16 @@ fn eval_atom(s: &str, _samples: &Vec<Sample>, sample: &Sample, entry: &Entry, sa
         s2 = &s2[1..];
     }
     if s2.starts_with("tax") {
-        // require nodes map to operate properly
-    if nodes.is_none() {
+        if taxonomy.is_none() {
             // without taxdump, fall back to simple taxpath string checks (less robust)
             if s2.starts_with("tax==") {
                 let v = s2[5..].trim();
-                let contains = entry.taxpath.split('|').last().map(|t| t == v).unwrap_or(false);
+                let contains = entry
+                    .taxpath
+                    .split('|')
+                    .last()
+                    .map(|t| t == v)
+                    .unwrap_or(false);
                 return if negate { !contains } else { contains };
             }
             if s2.starts_with("tax<=") {
@@ -339,57 +426,50 @@ fn eval_atom(s: &str, _samples: &Vec<Sample>, sample: &Sample, entry: &Entry, sa
             if s2.starts_with("tax<") {
                 let v = s2[4..].trim();
                 let contains = entry.taxpath.split('|').any(|t| t == v);
-                let eq = entry.taxpath.split('|').last().map(|t| t == v).unwrap_or(false);
+                let eq = entry
+                    .taxpath
+                    .split('|')
+                    .last()
+                    .map(|t| t == v)
+                    .unwrap_or(false);
                 let res = contains && !eq;
                 return if negate { !res } else { res };
             }
             return false;
         }
 
-        let nodes = nodes.unwrap();
-        let v = if s2.starts_with("tax==") { Some(s2[5..].trim()) } else if s2.starts_with("tax<=") { Some(s2[5..].trim()) } else if s2.starts_with("tax<") { Some(s2[4..].trim()) } else { None };
-        if v.is_none() { return false; }
-        let target = v.unwrap();
-        // Use ancestors map if provided for fast membership checks
-        if let Some(anc) = ancestors {
-            let set = anc.get(&entry.taxid);
-            if s2.starts_with("tax==") {
-                let res = entry.taxid == target;
-                return if negate { !res } else { res };
-            }
-            if s2.starts_with("tax<=") {
-                let res = match set { Some(st) => st.contains(target) || entry.taxid == target, None => false };
-                return if negate { !res } else { res };
-            }
-            if s2.starts_with("tax<") {
-                let res = match set { Some(st) => (st.contains(target) || entry.taxid == target) && entry.taxid != target, None => false };
-                return if negate { !res } else { res };
-            }
+        let taxonomy = taxonomy.unwrap();
+        let v = if s2.starts_with("tax==") {
+            Some(s2[5..].trim())
+        } else if s2.starts_with("tax<=") {
+            Some(s2[5..].trim())
+        } else if s2.starts_with("tax<") {
+            Some(s2[4..].trim())
         } else {
-            // fallback: entry.taxid should be used; walk up parents via nodes map
-            let mut cur = entry.taxid.clone();
-            let mut found = false;
-            while let Some((parent, _rank)) = nodes.get(&cur) {
-                if cur == target {
-                    found = true;
-                    break;
-                }
-                if parent == &cur { break; }
-                cur = parent.clone();
-            }
-            if !found && cur == target { found = true; }
-            if s2.starts_with("tax==") {
-                let res = entry.taxid == target;
-                return if negate { !res } else { res };
-            }
-            if s2.starts_with("tax<=") {
-                let res = found || entry.taxid == target;
-                return if negate { !res } else { res };
-            }
-            if s2.starts_with("tax<") {
-                let res = (found || entry.taxid == target) && entry.taxid != target;
-                return if negate { !res } else { res };
-            }
+            None
+        };
+        if v.is_none() {
+            return false;
+        }
+        let target = v.unwrap();
+        if s2.starts_with("tax==") {
+            let res = entry.taxid == target;
+            return if negate { !res } else { res };
+        }
+        let ancestors = taxonomy.ancestors.get(&entry.taxid);
+        if s2.starts_with("tax<=") {
+            let res = ancestors
+                .map(|anc| anc.iter().any(|t| t == target))
+                .unwrap_or(false)
+                || entry.taxid == target;
+            return if negate { !res } else { res };
+        }
+        if s2.starts_with("tax<") {
+            let is_ancestor = ancestors
+                .map(|anc| anc.iter().any(|t| t == target))
+                .unwrap_or(false);
+            let res = (is_ancestor || entry.taxid == target) && entry.taxid != target;
+            return if negate { !res } else { res };
         }
     }
 
@@ -398,7 +478,7 @@ fn eval_atom(s: &str, _samples: &Vec<Sample>, sample: &Sample, entry: &Entry, sa
 
 fn expr_needs_taxdump(e: &Expr) -> bool {
     match e {
-        Expr::And(a,b) | Expr::Or(a,b) => expr_needs_taxdump(a) || expr_needs_taxdump(b),
+        Expr::And(a, b) | Expr::Or(a, b) => expr_needs_taxdump(a) || expr_needs_taxdump(b),
         Expr::Atom(s) => s.contains("tax"),
     }
 }
@@ -414,7 +494,11 @@ fn write_cami(samples: &Vec<Sample>, out: &mut dyn io::Write) -> Result<()> {
         }
         writeln!(out, "@@TAXID\tRANK\tTAXPATH\tTAXPATHSN\tPERCENTAGE")?;
         for e in &s.entries {
-            writeln!(out, "{}\t{}\t{}\t{}\t{}", e.taxid, e.rank, e.taxpath, e.taxpathsn, e.percentage)?;
+            writeln!(
+                out,
+                "{}\t{}\t{}\t{}\t{}",
+                e.taxid, e.rank, e.taxpath, e.taxpathsn, e.percentage
+            )?;
         }
     }
     Ok(())
@@ -437,9 +521,39 @@ fn ensure_taxdump(dir: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn parse_taxdump(dir: &PathBuf) -> Result<(HashMap<String, (String, String)>, HashMap<String, String>)> {
-    // nodes.dmp: taxid\t| parent\t| rank\t| ...
-    let mut nodes = HashMap::new();
+fn build_ancestors(nodes: &HashMap<String, TaxNode>) -> HashMap<String, Vec<String>> {
+    fn helper(
+        taxid: &str,
+        nodes: &HashMap<String, TaxNode>,
+        cache: &mut HashMap<String, Vec<String>>,
+    ) -> Vec<String> {
+        if let Some(existing) = cache.get(taxid) {
+            return existing.clone();
+        }
+        let mut res = Vec::new();
+        if let Some(node) = nodes.get(taxid) {
+            if node.parent != taxid {
+                res.push(node.parent.clone());
+                let mut parent_line = helper(&node.parent, nodes, cache);
+                res.append(&mut parent_line);
+            }
+        }
+        cache.insert(taxid.to_string(), res.clone());
+        res
+    }
+
+    let mut cache: HashMap<String, Vec<String>> = HashMap::new();
+    let keys: Vec<String> = nodes.keys().cloned().collect();
+    for taxid in keys {
+        if !cache.contains_key(&taxid) {
+            helper(&taxid, nodes, &mut cache);
+        }
+    }
+    cache
+}
+
+fn parse_taxdump(dir: &PathBuf) -> Result<Taxonomy> {
+    let mut nodes: HashMap<String, TaxNode> = HashMap::new();
     let mut names = HashMap::new();
     let nodes_path = dir.join("nodes.dmp");
     let names_path = dir.join("names.dmp");
@@ -461,50 +575,64 @@ fn parse_taxdump(dir: &PathBuf) -> Result<(HashMap<String, (String, String)>, Ha
             let taxid = parts[0].trim().to_string();
             let parent = parts[1].trim().to_string();
             let rank = parts[2].trim().to_string();
-            nodes.insert(taxid, (parent, rank));
+            nodes.insert(taxid, TaxNode { parent, rank });
         }
     }
-    Ok((nodes, names))
+    let ancestors = build_ancestors(&nodes);
+    Ok(Taxonomy {
+        nodes,
+        names,
+        ancestors,
+    })
 }
 
-fn lineage(taxid: &str, nodes: &HashMap<String,(String,String)>, names: &HashMap<String,String>) -> Vec<(String,String,String)> {
-    let mut res = Vec::new();
-    let mut cur = taxid.to_string();
-    let mut seen = std::collections::HashSet::new();
-    while !seen.contains(&cur) {
-        seen.insert(cur.clone());
-        if let Some((parent, rank)) = nodes.get(&cur) {
-            let name = names.get(&cur).cloned().unwrap_or_else(|| cur.clone());
-            res.push((cur.clone(), rank.clone(), name));
-            if parent == &cur { break; }
-            cur = parent.clone();
-        } else {
-            // unknown taxid, stop
-            let name = names.get(&cur).cloned().unwrap_or_else(|| cur.clone());
-            res.push((cur.clone(), "no_rank".to_string(), name));
-            break;
+impl Taxonomy {
+    fn lineage(&self, taxid: &str) -> Vec<(String, String, String)> {
+        let mut res = Vec::new();
+        let mut cur = taxid.to_string();
+        let mut seen = std::collections::HashSet::new();
+        while !seen.contains(&cur) {
+            seen.insert(cur.clone());
+            if let Some(node) = self.nodes.get(&cur) {
+                let name = self.names.get(&cur).cloned().unwrap_or_else(|| cur.clone());
+                res.push((cur.clone(), node.rank.clone(), name));
+                if node.parent == cur {
+                    break;
+                }
+                cur = node.parent.clone();
+            } else {
+                let name = self.names.get(&cur).cloned().unwrap_or_else(|| cur.clone());
+                res.push((cur.clone(), "no_rank".to_string(), name));
+                break;
+            }
         }
+        res.reverse();
+        res
     }
-    res.reverse();
-    res
 }
 
-fn fill_up_samples(samples: &mut Vec<Sample>, to_rank: &str, nodes: &HashMap<String,(String,String)>, names: &HashMap<String,String>) {
+fn fill_up_samples(samples: &mut Vec<Sample>, to_rank: &str, taxonomy: &Taxonomy) {
     for s in samples.iter_mut() {
-        let rank_pos = s.ranks.iter().position(|r| r == to_rank).unwrap_or(0);
-        // accumulate map (taxid, rank) -> percentage
-        let mut acc: HashMap<(String,String), f64> = HashMap::new();
+        if s.entries.is_empty() {
+            continue;
+        }
+        let Some(target_pos) = s.ranks.iter().position(|r| r == to_rank) else {
+            continue;
+        };
+        let mut acc: HashMap<(String, String), f64> = HashMap::new();
         for e in &s.entries {
-            // compute lineage for this taxid
-            let lin = lineage(&e.taxid, nodes, names);
-            // create map from rank -> taxid
-            let mut rank_to_taxid: HashMap<String,String> = HashMap::new();
-            for (tid, rnk, _name) in &lin {
+            let lineage = taxonomy.lineage(&e.taxid);
+            if lineage.is_empty() {
+                continue;
+            }
+            let mut rank_to_taxid: HashMap<String, String> = HashMap::new();
+            for (tid, rnk, _name) in &lineage {
                 rank_to_taxid.insert(rnk.clone(), tid.clone());
             }
-            // for every rank from this entry rank up to to_rank, find ancestor with that rank
-            if let Some(pos_e_rank) = s.ranks.iter().position(|r| r == &e.rank) {
-                for pos in pos_e_rank..=rank_pos {
+            if let Some(entry_pos) = s.ranks.iter().position(|r| r == &e.rank) {
+                let start = min(entry_pos, target_pos);
+                let end = max(entry_pos, target_pos);
+                for pos in start..=end {
                     let target_rank = &s.ranks[pos];
                     if let Some(taxid_for_rank) = rank_to_taxid.get(target_rank) {
                         let key = (taxid_for_rank.clone(), target_rank.clone());
@@ -513,16 +641,49 @@ fn fill_up_samples(samples: &mut Vec<Sample>, to_rank: &str, nodes: &HashMap<Str
                 }
             }
         }
-        // rebuild entries from acc
-        let mut new_entries: Vec<Entry> = Vec::new();
-        for ((tid, rnk), pct) in acc.into_iter() {
-            // build taxpath by walking lineage to tid
-            let lin = lineage(&tid, nodes, names);
-            let taxpath = lin.iter().map(|(t,_,_)| t.clone()).collect::<Vec<_>>().join("|");
-            let taxpathsn = lin.iter().map(|(_,_,n)| n.clone()).collect::<Vec<_>>().join("|");
-            new_entries.push(Entry { taxid: tid, rank: rnk, taxpath, taxpathsn, percentage: pct });
+        if acc.is_empty() {
+            continue;
         }
-        // replace entries
+        let mut new_entries: Vec<Entry> = acc
+            .into_iter()
+            .map(|((tid, rank), pct)| {
+                let lineage = taxonomy.lineage(&tid);
+                let taxpath = lineage
+                    .iter()
+                    .map(|(t, _, _)| t.clone())
+                    .collect::<Vec<_>>()
+                    .join("|");
+                let taxpathsn = lineage
+                    .iter()
+                    .map(|(_, _, n)| n.clone())
+                    .collect::<Vec<_>>()
+                    .join("|");
+                Entry {
+                    taxid: tid,
+                    rank,
+                    taxpath,
+                    taxpathsn,
+                    percentage: pct,
+                }
+            })
+            .collect();
+        new_entries.sort_by(|a, b| {
+            let pa = s
+                .ranks
+                .iter()
+                .position(|r| r == &a.rank)
+                .unwrap_or(usize::MAX);
+            let pb = s
+                .ranks
+                .iter()
+                .position(|r| r == &b.rank)
+                .unwrap_or(usize::MAX);
+            if pa == pb {
+                a.taxpath.cmp(&b.taxpath)
+            } else {
+                pa.cmp(&pb)
+            }
+        });
         s.entries = new_entries;
     }
 }
@@ -533,9 +694,11 @@ fn renormalize(samples: &mut Vec<Sample>) {
         for (i, e) in s.entries.iter().enumerate() {
             by_rank.entry(e.rank.clone()).or_default().push(i);
         }
-    for (_r, idxs) in by_rank {
+        for (_r, idxs) in by_rank {
             let sum: f64 = idxs.iter().map(|&i| s.entries[i].percentage).sum();
-            if sum == 0.0 { continue; }
+            if sum == 0.0 {
+                continue;
+            }
             for &i in &idxs {
                 s.entries[i].percentage = s.entries[i].percentage / sum * 100.0;
             }
@@ -546,77 +709,101 @@ fn renormalize(samples: &mut Vec<Sample>) {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match &cli.command {
-        Commands::Filter { expression, output, fill_up, to_rank, renorm, input } => {
-            let input = input.as_ref().cloned().unwrap_or_else(|| PathBuf::from("examples/text.cami"));
+        Commands::Filter {
+            expression,
+            output,
+            fill_up,
+            to_rank,
+            renorm,
+            input,
+        } => {
+            let input = input
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| PathBuf::from("examples/text.cami"));
             let samples = parse_cami(&input)?;
             let expr = parse_expression(expression).with_context(|| "parsing expression")?;
-            let mut out: Box<dyn io::Write> = if let Some(p) = output { Box::new(File::create(p)? ) } else { Box::new(io::stdout()) };
+            let mut out: Box<dyn io::Write> = if let Some(p) = output {
+                Box::new(File::create(p)?)
+            } else {
+                Box::new(io::stdout())
+            };
             let mut filtered: Vec<Sample> = Vec::new();
-            // if expression contains tax atoms, we need to parse taxdump first
-            let needs_taxdump = expr_needs_taxdump(&expr);
-            let (nodes_opt, names_opt, ancestors_opt) = if needs_taxdump || *fill_up {
-                let cami_dir = dirs::home_dir().map(|p| p.join(".cami")).unwrap_or_else(|| PathBuf::from(".cami"));
-                let need_download = !(cami_dir.join("nodes.dmp").exists() && cami_dir.join("names.dmp").exists());
+            let needs_taxdump = expr_needs_taxdump(&expr) || *fill_up;
+            let taxonomy = if needs_taxdump {
+                let cami_dir = dirs::home_dir()
+                    .map(|p| p.join(".cami"))
+                    .unwrap_or_else(|| PathBuf::from(".cami"));
+                let need_download =
+                    !(cami_dir.join("nodes.dmp").exists() && cami_dir.join("names.dmp").exists());
                 if need_download {
                     eprintln!("downloading taxdump to {}", cami_dir.display());
                 }
-                ensure_taxdump(&cami_dir).with_context(|| format!("ensuring taxdump in {}", cami_dir.display()))?;
-                let (nodes, names) = parse_taxdump(&cami_dir)?;
-                // build ancestors set for each taxid for fast membership queries
-                let mut anc: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
-                for taxid in nodes.keys() {
-                    let mut set = std::collections::HashSet::new();
-                    let mut cur = taxid.clone();
-                    while let Some((parent, _)) = nodes.get(&cur) {
-                        if parent == &cur { break; }
-                        set.insert(parent.clone());
-                        cur = parent.clone();
-                    }
-                    anc.insert(taxid.clone(), set);
-                }
-                (Some(nodes), Some(names), Some(anc))
+                ensure_taxdump(&cami_dir)
+                    .with_context(|| format!("ensuring taxdump in {}", cami_dir.display()))?;
+                Some(parse_taxdump(&cami_dir)?)
             } else {
-                (None, None, None)
+                None
             };
 
             for (i, s) in samples.iter().enumerate() {
                 let mut ns = s.clone();
-                ns.entries = ns.entries.into_iter().filter(|e| eval_expr(&expr, &samples, s, e, i, nodes_opt.as_ref(), names_opt.as_ref(), ancestors_opt.as_ref())).collect();
-                filtered.push(ns);
+                ns.entries = ns
+                    .entries
+                    .into_iter()
+                    .filter(|e| eval_expr(&expr, &samples, s, e, i, taxonomy.as_ref()))
+                    .collect();
+                if !ns.entries.is_empty() {
+                    filtered.push(ns);
+                }
             }
             if *fill_up {
-                // ensure taxdump is available and parse it; print message only if we need to download
-                let cami_dir = dirs::home_dir().map(|p| p.join(".cami")).unwrap_or_else(|| PathBuf::from(".cami"));
-                let need_download = !(cami_dir.join("nodes.dmp").exists() && cami_dir.join("names.dmp").exists());
-                if need_download {
-                    eprintln!("downloading taxdump to {}", cami_dir.display());
+                let tax = taxonomy
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("fill-up requires taxonomy data"))?;
+                fill_up_samples(&mut filtered, to_rank, tax);
+                if *renorm {
+                    renormalize(&mut filtered);
                 }
-                ensure_taxdump(&cami_dir).with_context(|| format!("ensuring taxdump in {}", cami_dir.display()))?;
-                let (nodes, names) = parse_taxdump(&cami_dir)?;
-                let mut filtered_mut = filtered;
-                fill_up_samples(&mut filtered_mut, to_rank, &nodes, &names);
-                if *renorm { renormalize(&mut filtered_mut); }
-                write_cami(&mut filtered_mut, &mut *out)?;
+                write_cami(&filtered, &mut *out)?;
+            } else if *renorm {
+                let mut renormed = filtered.clone();
+                renormalize(&mut renormed);
+                write_cami(&renormed, &mut *out)?;
             } else {
-                if *renorm { let mut f = filtered.clone(); renormalize(&mut f); write_cami(&f, &mut *out)?; } else { write_cami(&filtered, &mut *out)?; }
+                write_cami(&filtered, &mut *out)?;
             }
         }
         Commands::Preview { n, input } => {
-            let input = input.as_ref().cloned().unwrap_or_else(|| PathBuf::from("examples/text.cami"));
+            let input = input
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| PathBuf::from("examples/text.cami"));
             let samples = parse_cami(&input)?;
             let mut out = io::stdout();
             for s in &samples {
                 writeln!(out, "@SampleID:{}", s.id)?;
-                if let Some(v) = &s.version { writeln!(out, "@Version:{}", v)?; }
-                if !s.ranks.is_empty() { writeln!(out, "@Ranks:{}", s.ranks.join("|"))?; }
+                if let Some(v) = &s.version {
+                    writeln!(out, "@Version:{}", v)?;
+                }
+                if !s.ranks.is_empty() {
+                    writeln!(out, "@Ranks:{}", s.ranks.join("|"))?;
+                }
                 writeln!(out, "@@TAXID\tRANK\tTAXPATH\tTAXPATHSN\tPERCENTAGE")?;
                 for e in s.entries.iter().take(*n) {
-                    writeln!(out, "{}\t{}\t{}\t{}\t{}", e.taxid, e.rank, e.taxpath, e.taxpathsn, e.percentage)?;
+                    writeln!(
+                        out,
+                        "{}\t{}\t{}\t{}\t{}",
+                        e.taxid, e.rank, e.taxpath, e.taxpathsn, e.percentage
+                    )?;
                 }
             }
         }
         Commands::List { input } => {
-            let input = input.as_ref().cloned().unwrap_or_else(|| PathBuf::from("examples/text.cami"));
+            let input = input
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| PathBuf::from("examples/text.cami"));
             let samples = parse_cami(&input)?;
             let mut out = io::stdout();
             for s in &samples {
@@ -624,8 +811,10 @@ fn main() -> Result<()> {
                 writeln!(out, "  Ranks: {}", s.ranks.join(", "))?;
                 writeln!(out, "  Taxa: {}", s.entries.len())?;
                 // totals per rank
-                let mut totals: HashMap<String,f64> = HashMap::new();
-                for e in &s.entries { *totals.entry(e.rank.clone()).or_insert(0.0) += e.percentage; }
+                let mut totals: HashMap<String, f64> = HashMap::new();
+                for e in &s.entries {
+                    *totals.entry(e.rank.clone()).or_insert(0.0) += e.percentage;
+                }
                 for r in &s.ranks {
                     let t = totals.get(r).cloned().unwrap_or(0.0);
                     writeln!(out, "    {}: {:.6}", r, t)?;
