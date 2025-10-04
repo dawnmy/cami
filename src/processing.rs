@@ -143,7 +143,6 @@ pub fn fill_up_to(
                 });
             }
         }
-
         sample.entries = new_entries;
     }
 }
