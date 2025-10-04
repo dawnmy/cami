@@ -1,19 +1,24 @@
+use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 
 use crate::cami;
 use crate::cami::{Entry, Sample};
+use crate::expression::{apply_filter, expr_needs_taxdump, parse_expression};
+use crate::taxonomy::{Taxonomy, ensure_taxdump};
 
 #[derive(Clone)]
 pub struct BenchmarkConfig {
     pub ground_truth: PathBuf,
     pub predictions: Vec<PathBuf>,
     pub labels: Vec<String>,
-    pub gmin: Option<f64>,
+    pub all_filter: Option<String>,
+    pub ground_filter: Option<String>,
+    pub pred_filter: Option<String>,
     pub normalize: bool,
     pub by_domain: bool,
     pub output: PathBuf,
@@ -25,7 +30,6 @@ struct ProfileEntry {
     taxid: String,
     percentage: f64,
     taxpath: String,
-    taxpathsn: String,
 }
 
 pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
@@ -37,9 +41,59 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
         bail!("labels count must match number of predicted profiles");
     }
 
-    let gt_samples = cami::parse_cami(&cfg.ground_truth)?;
+    let all_expr = cfg
+        .all_filter
+        .as_ref()
+        .map(|s| parse_expression(s))
+        .transpose()
+        .context("parsing global filter expression")?;
+    let ground_expr = cfg
+        .ground_filter
+        .as_ref()
+        .map(|s| parse_expression(s))
+        .transpose()
+        .context("parsing ground-truth filter expression")?;
+    let pred_expr = cfg
+        .pred_filter
+        .as_ref()
+        .map(|s| parse_expression(s))
+        .transpose()
+        .context("parsing predicted-profile filter expression")?;
+
+    let needs_taxdump = all_expr
+        .as_ref()
+        .is_some_and(|expr| expr_needs_taxdump(expr))
+        || ground_expr
+            .as_ref()
+            .is_some_and(|expr| expr_needs_taxdump(expr))
+        || pred_expr
+            .as_ref()
+            .is_some_and(|expr| expr_needs_taxdump(expr));
+
+    let taxonomy = if needs_taxdump {
+        let dir = taxonomy_dir();
+        ensure_taxdump(&dir).with_context(|| format!("ensuring taxdump in {}", dir.display()))?;
+        Some(Taxonomy::load(&dir)?)
+    } else {
+        None
+    };
+
+    let mut gt_samples = cami::parse_cami(&cfg.ground_truth)?;
     if gt_samples.is_empty() {
         bail!("ground truth profile has no samples");
+    }
+
+    if let Some(expr) = all_expr.as_ref() {
+        gt_samples = apply_filter(&gt_samples, expr, taxonomy.as_ref());
+    }
+
+    if let Some(expr) = ground_expr.as_ref() {
+        gt_samples = apply_filter(&gt_samples, expr, taxonomy.as_ref());
+        if gt_samples.is_empty() {
+            bail!("ground truth profile has no samples after applying filters");
+        }
+    } else if gt_samples.is_empty() {
+        bail!("ground truth profile has no samples after applying filters");
     }
 
     fs::create_dir_all(&cfg.output)
@@ -83,13 +137,12 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
             .with_context(|| format!("creating benchmark report {}", path.display()))?;
         writeln!(
             writer,
-            "profile\tsample\trank\ttp\tfp\tfn\tprecision\trecall\tf1\tjaccard\tl1_error\tbray_curtis\tshannon_pred\tshannon_truth\tevenness_pred\tevenness_truth\tpearson\tspearman\tweighted_unifrac\tunweighted_unifrac"
+            "profile\tsample\trank\ttp\tfp\tfn\tprecision\trecall\tf1\tjaccard\tl1_error\tbray_curtis\tshannon_pred\tshannon_truth\tevenness_pred\tevenness_truth\tpearson\tspearman\tweighted_unifrac\tunweighted_unifrac\tabundance_rank_error"
         )?;
 
         let gt_map = build_profile_map(
             &gt_samples,
             ranks.as_ref(),
-            cfg.gmin,
             cfg.normalize,
             domain.as_deref(),
         );
@@ -98,11 +151,16 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
         sample_ids.sort();
 
         for (pred_path, label) in cfg.predictions.iter().zip(labels.iter()) {
-            let pred_samples = cami::parse_cami(pred_path)?;
+            let mut pred_samples = cami::parse_cami(pred_path)?;
+            if let Some(expr) = all_expr.as_ref() {
+                pred_samples = apply_filter(&pred_samples, expr, taxonomy.as_ref());
+            }
+            if let Some(expr) = pred_expr.as_ref() {
+                pred_samples = apply_filter(&pred_samples, expr, taxonomy.as_ref());
+            }
             let pred_map = build_profile_map(
                 &pred_samples,
                 ranks.as_ref(),
-                None,
                 cfg.normalize,
                 domain.as_deref(),
             );
@@ -120,7 +178,7 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
                         .and_then(|map| map.get(&rank))
                         .map(|v| v.as_slice())
                         .unwrap_or(&[]);
-                    let metrics = compute_metrics(gt_entries, pred_entries);
+                    let metrics = compute_metrics(gt_entries, pred_entries)?;
                     write_metrics(&mut writer, label, sample_id, &rank, &metrics)?;
                 }
             }
@@ -158,7 +216,6 @@ fn canonical_rank(rank: &str) -> Result<String> {
 fn build_profile_map(
     samples: &[Sample],
     ranks: Option<&Vec<String>>,
-    min_threshold: Option<f64>,
     normalize: bool,
     domain: Option<&str>,
 ) -> HashMap<String, HashMap<String, Vec<ProfileEntry>>> {
@@ -171,11 +228,6 @@ fn build_profile_map(
         for entry in &sample.entries {
             if entry.percentage <= 0.0 {
                 continue;
-            }
-            if let Some(threshold) = min_threshold {
-                if entry.percentage < threshold {
-                    continue;
-                }
             }
             if let Some(filter) = &rank_filter {
                 if !filter.contains(&entry.rank) {
@@ -194,7 +246,6 @@ fn build_profile_map(
                     taxid: entry.taxid.clone(),
                     percentage: entry.percentage,
                     taxpath: entry.taxpath.clone(),
-                    taxpathsn: entry.taxpathsn.clone(),
                 });
         }
 
@@ -244,22 +295,46 @@ struct Metrics {
     spearman: Option<f64>,
     weighted_unifrac: Option<f64>,
     unweighted_unifrac: Option<f64>,
+    abundance_rank_error: Option<f64>,
 }
 
-fn compute_metrics(gt_entries: &[ProfileEntry], pred_entries: &[ProfileEntry]) -> Metrics {
+fn compute_metrics(gt_entries: &[ProfileEntry], pred_entries: &[ProfileEntry]) -> Result<Metrics> {
     let mut metrics = Metrics::default();
-    let mut gt_map: HashMap<String, &ProfileEntry> = HashMap::new();
+    let mut gt_map: HashMap<String, f64> = HashMap::new();
     for entry in gt_entries {
+        ensure!(
+            !entry.percentage.is_nan(),
+            "ground truth abundance for taxid {} is NaN",
+            entry.taxid
+        );
+        ensure!(
+            entry.percentage >= 0.0,
+            "ground truth abundance for taxid {} is negative",
+            entry.taxid
+        );
         if entry.percentage > 0.0 {
-            gt_map.insert(entry.taxid.clone(), entry);
+            gt_map.insert(entry.taxid.clone(), entry.percentage);
         }
     }
-    let mut pred_map: HashMap<String, &ProfileEntry> = HashMap::new();
+    let mut pred_map: HashMap<String, f64> = HashMap::new();
     for entry in pred_entries {
+        ensure!(
+            !entry.percentage.is_nan(),
+            "predicted abundance for taxid {} is NaN",
+            entry.taxid
+        );
+        ensure!(
+            entry.percentage >= 0.0,
+            "predicted abundance for taxid {} is negative",
+            entry.taxid
+        );
         if entry.percentage > 0.0 {
-            pred_map.insert(entry.taxid.clone(), entry);
+            pred_map.insert(entry.taxid.clone(), entry.percentage);
         }
     }
+
+    let gt_total: f64 = gt_entries.iter().map(|e| e.percentage).sum();
+    let pred_total: f64 = pred_entries.iter().map(|e| e.percentage).sum();
 
     let mut union: BTreeSet<String> = BTreeSet::new();
     for taxid in gt_map.keys() {
@@ -276,9 +351,8 @@ fn compute_metrics(gt_entries: &[ProfileEntry], pred_entries: &[ProfileEntry]) -
     let mut sum_tot = 0.0;
 
     for taxid in &union {
-        let g = gt_map.get(taxid).map(|e| e.percentage).unwrap_or(0.0);
-        let p = pred_map.get(taxid).map(|e| e.percentage).unwrap_or(0.0);
-
+        let g = gt_map.get(taxid).copied().unwrap_or(0.0);
+        let p = pred_map.get(taxid).copied().unwrap_or(0.0);
         if g > 0.0 && p > 0.0 {
             metrics.tp += 1;
         } else if p > 0.0 {
@@ -286,10 +360,18 @@ fn compute_metrics(gt_entries: &[ProfileEntry], pred_entries: &[ProfileEntry]) -
         } else if g > 0.0 {
             metrics.fn_ += 1;
         }
-        sum_abs += (g - p).abs();
-        sum_tot += g + p;
-        gt_values.push(g);
-        pred_values.push(p);
+
+        let g_norm = if gt_total > 0.0 { g / gt_total } else { 0.0 };
+        let p_norm = if pred_total > 0.0 {
+            p / pred_total
+        } else {
+            0.0
+        };
+
+        sum_abs += (g_norm - p_norm).abs();
+        sum_tot += g_norm + p_norm;
+        gt_values.push(g_norm);
+        pred_values.push(p_norm);
     }
 
     metrics.l1_error = sum_abs;
@@ -316,11 +398,12 @@ fn compute_metrics(gt_entries: &[ProfileEntry], pred_entries: &[ProfileEntry]) -
     metrics.pearson = pearson(&gt_values, &pred_values);
     metrics.spearman = spearman(&gt_values, &pred_values);
 
-    let (weighted, unweighted) = unifrac(&gt_map, &pred_map);
+    let (weighted, unweighted) = unifrac(gt_entries, pred_entries, gt_total, pred_total);
     metrics.weighted_unifrac = weighted;
     metrics.unweighted_unifrac = unweighted;
+    metrics.abundance_rank_error = Some(abundance_rank_error(&gt_map, &pred_map)?);
 
-    metrics
+    Ok(metrics)
 }
 
 fn ratio(num: f64, denom: f64) -> Option<f64> {
@@ -409,63 +492,290 @@ fn rank_values(values: &[f64]) -> Vec<f64> {
 }
 
 fn unifrac(
-    gt_map: &HashMap<String, &ProfileEntry>,
-    pred_map: &HashMap<String, &ProfileEntry>,
+    gt_entries: &[ProfileEntry],
+    pred_entries: &[ProfileEntry],
+    gt_total: f64,
+    pred_total: f64,
 ) -> (Option<f64>, Option<f64>) {
-    let mut nodes: HashMap<String, (f64, f64)> = HashMap::new();
-    for entry in gt_map.values() {
-        for node in lineage_nodes(&entry.taxpath) {
-            let e = nodes.entry(node).or_insert((0.0, 0.0));
-            e.0 += entry.percentage;
-        }
-    }
-    for entry in pred_map.values() {
-        for node in lineage_nodes(&entry.taxpath) {
-            let e = nodes.entry(node).or_insert((0.0, 0.0));
-            e.1 += entry.percentage;
-        }
+    let gt_positive: Vec<&ProfileEntry> = gt_entries
+        .iter()
+        .filter(|entry| entry.percentage > 0.0)
+        .collect();
+    let pred_positive: Vec<&ProfileEntry> = pred_entries
+        .iter()
+        .filter(|entry| entry.percentage > 0.0)
+        .collect();
+
+    if gt_positive.is_empty() && pred_positive.is_empty() {
+        return (None, None);
     }
 
-    let mut sum_diff = 0.0;
-    let mut sum_total = 0.0;
-    let mut presence_diff = 0.0;
-    let mut presence_total = 0.0;
+    let gt_presence_mass = if gt_positive.is_empty() {
+        0.0
+    } else {
+        1.0 / gt_positive.len() as f64
+    };
+    let pred_presence_mass = if pred_positive.is_empty() {
+        0.0
+    } else {
+        1.0 / pred_positive.len() as f64
+    };
 
-    for (_node, (g, p)) in nodes {
-        let has_g = g > 0.0;
-        let has_p = p > 0.0;
-        if has_g || has_p {
-            sum_diff += (g - p).abs();
-            sum_total += g + p;
-            presence_total += 1.0;
-            if has_g ^ has_p {
-                presence_diff += 1.0;
+    let mut root = TreeNode::default();
+
+    let mut gt_mass_sum = 0.0;
+    let mut pred_mass_sum = 0.0;
+    for entry in &gt_positive {
+        let mass = if gt_total > 0.0 {
+            entry.percentage / gt_total
+        } else {
+            0.0
+        };
+        gt_mass_sum += mass;
+        let parts = split_taxpath(&entry.taxpath);
+        add_mass(&mut root, &parts, 0, mass, gt_presence_mass, true);
+    }
+
+    for entry in &pred_positive {
+        let mass = if pred_total > 0.0 {
+            entry.percentage / pred_total
+        } else {
+            0.0
+        };
+        pred_mass_sum += mass;
+        let parts = split_taxpath(&entry.taxpath);
+        add_mass(&mut root, &parts, 0, mass, pred_presence_mass, false);
+    }
+
+    if gt_total > 0.0 {
+        let remaining = (1.0 - gt_mass_sum).max(0.0);
+        if remaining > 1e-12 {
+            add_mass(&mut root, &[], 0, remaining, 0.0, true);
+        }
+    } else if gt_positive.is_empty() && pred_mass_sum > 0.0 {
+        add_mass(&mut root, &[], 0, 1.0, 0.0, true);
+    }
+
+    if pred_total > 0.0 {
+        let remaining = (1.0 - pred_mass_sum).max(0.0);
+        if remaining > 1e-12 {
+            add_mass(&mut root, &[], 0, remaining, 0.0, false);
+        }
+    } else if pred_positive.is_empty() && gt_mass_sum > 0.0 {
+        // When the prediction lacks taxa at this rank, place the full mass at the root so
+        // the earth-mover interpretation remains valid.
+        add_mass(&mut root, &[], 0, 1.0, 0.0, false);
+    }
+
+    let (
+        gt_mass,
+        pred_mass,
+        gt_presence_total,
+        pred_presence_total,
+        weighted_cost,
+        unweighted_cost,
+    ) = accumulate_flows(&root);
+
+    let weighted = if gt_mass > 0.0 || pred_mass > 0.0 {
+        Some(weighted_cost)
+    } else {
+        None
+    };
+
+    let unweighted = if gt_presence_total > 0.0 || pred_presence_total > 0.0 {
+        Some(unweighted_cost)
+    } else {
+        None
+    };
+
+    (weighted, unweighted)
+}
+
+#[derive(Default)]
+struct TreeNode {
+    children: HashMap<String, TreeNode>,
+    gt_mass: f64,
+    pred_mass: f64,
+    gt_presence: f64,
+    pred_presence: f64,
+}
+
+fn split_taxpath(path: &str) -> Vec<String> {
+    path.split('|')
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty())
+        .map(|part| part.to_string())
+        .collect()
+}
+
+fn add_mass(
+    node: &mut TreeNode,
+    parts: &[String],
+    idx: usize,
+    mass: f64,
+    presence: f64,
+    is_gt: bool,
+) {
+    if idx >= parts.len() {
+        if is_gt {
+            node.gt_mass += mass;
+            node.gt_presence += presence;
+        } else {
+            node.pred_mass += mass;
+            node.pred_presence += presence;
+        }
+        return;
+    }
+
+    let child = node
+        .children
+        .entry(parts[idx].clone())
+        .or_insert_with(TreeNode::default);
+    add_mass(child, parts, idx + 1, mass, presence, is_gt);
+}
+
+fn accumulate_flows(node: &TreeNode) -> (f64, f64, f64, f64, f64, f64) {
+    let mut gt_mass = node.gt_mass;
+    let mut pred_mass = node.pred_mass;
+    let mut gt_presence = node.gt_presence;
+    let mut pred_presence = node.pred_presence;
+    let mut weighted_cost = 0.0;
+    let mut unweighted_cost = 0.0;
+
+    for child in node.children.values() {
+        let (
+            child_gt_mass,
+            child_pred_mass,
+            child_gt_presence,
+            child_pred_presence,
+            child_weighted_cost,
+            child_unweighted_cost,
+        ) = accumulate_flows(child);
+        weighted_cost += child_weighted_cost + (child_gt_mass - child_pred_mass).abs();
+        unweighted_cost += child_unweighted_cost + (child_gt_presence - child_pred_presence).abs();
+        gt_mass += child_gt_mass;
+        pred_mass += child_pred_mass;
+        gt_presence += child_gt_presence;
+        pred_presence += child_pred_presence;
+    }
+
+    (
+        gt_mass,
+        pred_mass,
+        gt_presence,
+        pred_presence,
+        weighted_cost,
+        unweighted_cost,
+    )
+}
+
+fn abundance_rank_error(
+    gt_map: &HashMap<String, f64>,
+    pred_map: &HashMap<String, f64>,
+) -> Result<f64> {
+    let num_gt = gt_map.len();
+    let num_pred = pred_map.len();
+
+    if num_gt == 0 && num_pred == 0 {
+        return Ok(0.0);
+    }
+
+    let mut gt_sorted: Vec<(String, f64)> = gt_map
+        .iter()
+        .map(|(taxon, value)| (taxon.clone(), *value))
+        .collect();
+    gt_sorted.sort_by(
+        |a, b| match b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal) {
+            Ordering::Equal => a.0.cmp(&b.0),
+            other => other,
+        },
+    );
+
+    let mut pred_sorted: Vec<(String, f64)> = pred_map
+        .iter()
+        .map(|(taxon, value)| (taxon.clone(), *value))
+        .collect();
+    pred_sorted.sort_by(
+        |a, b| match b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal) {
+            Ordering::Equal => a.0.cmp(&b.0),
+            other => other,
+        },
+    );
+
+    let mut gt_ranks: HashMap<String, usize> = HashMap::new();
+    for (idx, (taxon, _)) in gt_sorted.iter().enumerate() {
+        gt_ranks.insert(taxon.clone(), idx + 1);
+    }
+
+    let mut pred_ranks: HashMap<String, usize> = HashMap::new();
+    for (idx, (taxon, _)) in pred_sorted.iter().enumerate() {
+        pred_ranks.insert(taxon.clone(), idx + 1);
+    }
+
+    let mut total_error = 0.0;
+
+    if num_gt > 0 {
+        let num_gt_f = num_gt as f64;
+        for (taxon, &gt_rank) in &gt_ranks {
+            if let Some(&pred_rank) = pred_ranks.get(taxon) {
+                let weight = (num_gt - gt_rank + 1) as f64 / num_gt_f;
+                let rank_diff = if gt_rank > pred_rank {
+                    (gt_rank - pred_rank) as f64
+                } else {
+                    (pred_rank - gt_rank) as f64
+                };
+                total_error += rank_diff * weight;
+            }
+        }
+
+        for (taxon, &gt_rank) in &gt_ranks {
+            if !pred_ranks.contains_key(taxon) {
+                let offset = (num_gt - gt_rank + 1) as f64;
+                let weight = offset / num_gt_f;
+                total_error += offset * weight;
             }
         }
     }
 
-    let weighted = if sum_total > 0.0 {
-        Some(sum_diff / sum_total)
-    } else {
-        None
-    };
-    let unweighted = if presence_total > 0.0 {
-        Some(presence_diff / presence_total)
-    } else {
-        None
-    };
-    (weighted, unweighted)
-}
-
-fn lineage_nodes(path: &str) -> Vec<String> {
-    let mut nodes = Vec::new();
-    let parts: Vec<&str> = path.split('|').filter(|p| !p.is_empty()).collect();
-    let mut current: Vec<&str> = Vec::new();
-    for part in parts {
-        current.push(part);
-        nodes.push(current.join("|"));
+    if num_pred > 0 {
+        let num_pred_f = num_pred as f64;
+        for (taxon, &pred_rank) in &pred_ranks {
+            if !gt_ranks.contains_key(taxon) {
+                let offset = (num_pred - pred_rank + 1) as f64;
+                let weight = offset / num_pred_f;
+                total_error += offset * weight;
+            }
+        }
     }
-    nodes
+
+    let mut normalization = 0.0;
+    if num_gt > 0 {
+        let num_gt_f = num_gt as f64;
+        for j in 1..=num_gt {
+            let term = (num_gt + 1 - j) as f64;
+            normalization += (term * term) / num_gt_f;
+        }
+    }
+    if num_pred > 0 {
+        let num_pred_f = num_pred as f64;
+        for k in 1..=num_pred {
+            let term = (num_pred + 1 - k) as f64;
+            normalization += (term * term) / num_pred_f;
+        }
+    }
+
+    if normalization <= 0.0 {
+        return Ok(0.0);
+    }
+
+    let ratio = total_error / normalization;
+    if ratio < 0.0 {
+        Ok(0.0)
+    } else if ratio > 1.0 {
+        Ok(1.0)
+    } else {
+        Ok(ratio)
+    }
 }
 
 fn write_metrics<W: Write>(
@@ -477,7 +787,7 @@ fn write_metrics<W: Write>(
 ) -> Result<()> {
     writeln!(
         writer,
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         label,
         sample,
         rank,
@@ -497,7 +807,8 @@ fn write_metrics<W: Write>(
         format_opt(metrics.pearson),
         format_opt(metrics.spearman),
         format_opt(metrics.weighted_unifrac),
-        format_opt(metrics.unweighted_unifrac)
+        format_opt(metrics.unweighted_unifrac),
+        format_opt(metrics.abundance_rank_error)
     )?;
     Ok(())
 }
@@ -509,5 +820,64 @@ fn format_opt(value: Option<f64>) -> String {
 }
 
 fn format_float(value: f64) -> String {
-    format!("{:.6}", value)
+    format!("{:.5}", value)
+}
+
+fn taxonomy_dir() -> PathBuf {
+    dirs::home_dir()
+        .map(|p| p.join(".cami"))
+        .unwrap_or_else(|| PathBuf::from(".cami"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::abundance_rank_error;
+    use std::collections::HashMap;
+
+    fn map(entries: &[(&str, f64)]) -> HashMap<String, f64> {
+        entries
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), *value))
+            .collect()
+    }
+
+    #[test]
+    fn abundance_rank_error_perfect_match() {
+        let gt = map(&[("A", 0.5), ("B", 0.3), ("C", 0.2)]);
+        let pred = map(&[("A", 0.5), ("B", 0.3), ("C", 0.2)]);
+        let score = abundance_rank_error(&gt, &pred).unwrap();
+        assert!((score - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn abundance_rank_error_rank_swap() {
+        let gt = map(&[("A", 0.5), ("B", 0.3), ("C", 0.2)]);
+        let pred = map(&[("B", 0.5), ("A", 0.3), ("C", 0.2)]);
+        let score = abundance_rank_error(&gt, &pred).unwrap();
+        assert!(score > 0.0 && score < 1.0);
+    }
+
+    #[test]
+    fn abundance_rank_error_only_missed_taxa() {
+        let gt = map(&[("A", 0.6), ("B", 0.4)]);
+        let pred = map(&[]);
+        let score = abundance_rank_error(&gt, &pred).unwrap();
+        assert!((score - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn abundance_rank_error_only_false_positives() {
+        let gt = map(&[]);
+        let pred = map(&[("X", 0.7), ("Y", 0.3)]);
+        let score = abundance_rank_error(&gt, &pred).unwrap();
+        assert!((score - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn abundance_rank_error_mixed_case() {
+        let gt = map(&[("A", 0.6), ("B", 0.3), ("C", 0.1)]);
+        let pred = map(&[("A", 0.55), ("C", 0.35), ("D", 0.10)]);
+        let score = abundance_rank_error(&gt, &pred).unwrap();
+        assert!(score > 0.0 && score < 1.0);
+    }
 }

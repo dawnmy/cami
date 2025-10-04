@@ -51,7 +51,7 @@ fn split_ranks(input: &str) -> Vec<String> {
 enum Commands {
     #[command(
         about = "Benchmark predicted profiles against a ground truth",
-        long_about = "Compare predicted CAMI abundance tables to a ground truth profile per sample and rank. Reports TP/FP/FN counts, precision (purity), recall (completeness), F1-score, Jaccard index, L1 error, Bray-Curtis distance, Shannon diversity, equitability, Pearson and Spearman correlations, plus weighted and unweighted UniFrac differences."
+        long_about = "Compare predicted CAMI abundance tables to a ground truth profile per sample and rank. Reports TP/FP/FN counts, precision (purity), recall (completeness), F1-score, Jaccard index, L1 error, Bray-Curtis distance, Shannon diversity, equitability, Pearson and Spearman correlations, weighted and unweighted UniFrac differences, and the Abundance Rank Error (ARE)."
     )]
     Benchmark {
         #[arg(
@@ -75,11 +75,26 @@ enum Commands {
         )]
         labels: Option<String>,
         #[arg(
-            long = "gmin",
-            value_name = "MIN",
-            help = "Ignore ground truth taxa below this abundance percentage."
+            long = "af",
+            value_name = "EXPR",
+            help = "Filter expression applied to both ground truth and predicted profiles before scoring.",
+            long_help = "Expression syntax matches `cami filter`, combining rank (r), sample (s), abundance (a), taxonomy (t/tax), and cumulative-sum (c) predicates with & (and), | (or), and parentheses."
         )]
-        gmin: Option<f64>,
+        all_filter: Option<String>,
+        #[arg(
+            long = "gf",
+            value_name = "EXPR",
+            help = "Filter expression applied to the ground truth profile before scoring.",
+            long_help = "Expression syntax matches `cami filter`, combining rank (r), sample (s), abundance (a), taxonomy (t/tax), and cumulative-sum (c) predicates with & (and), | (or), and parentheses."
+        )]
+        ground_filter: Option<String>,
+        #[arg(
+            long = "pf",
+            value_name = "EXPR",
+            help = "Filter expression applied to each predicted profile before scoring.",
+            long_help = "Expression syntax matches `cami filter`, combining rank (r), sample (s), abundance (a), taxonomy (t/tax), and cumulative-sum (c) predicates with & (and), | (or), and parentheses."
+        )]
+        pred_filter: Option<String>,
         #[arg(
             short = 'n',
             long = "normalize",
@@ -262,7 +277,9 @@ fn main() -> Result<()> {
             ground_truth,
             predictions,
             labels,
-            gmin,
+            all_filter,
+            ground_filter,
+            pred_filter,
             normalize,
             by_domain,
             output,
@@ -274,7 +291,9 @@ fn main() -> Result<()> {
                 ground_truth: ground_truth.clone(),
                 predictions: predictions.clone(),
                 labels: label_vec,
-                gmin: *gmin,
+                all_filter: all_filter.clone(),
+                ground_filter: ground_filter.clone(),
+                pred_filter: pred_filter.clone(),
                 normalize: *normalize,
                 by_domain: *by_domain,
                 output: output.clone(),

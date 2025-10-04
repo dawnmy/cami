@@ -10,7 +10,7 @@
 - Fill in missing higher ranks by pulling lineage information from the NCBI taxdump and round abundances to five decimal places.
 - Renormalize abundances so that every rank in every sample sums to 100.
 - Reorder taxa within each rank, either by abundance (dropping zeroes) or by lineage, to make tables easier to scan.
-- Benchmark predicted profiles against ground truth tables with precision/recall, abundance error, correlation, diversity, and UniFrac metrics.
+- Benchmark predicted profiles against ground truth tables with precision/recall, abundance error, correlation, diversity, UniFrac, and abundance-rank metrics.
 
 The repository includes a small demo table at [`examples/test.cami`](examples/test.cami) that you can use with the examples below.
 
@@ -131,18 +131,20 @@ cami sort --taxpathsn examples/test.cami > lineage_sorted.cami
 
 ### `cami benchmark`
 
-Evaluate one or more predicted profiles against a ground-truth CAMI table. For every sample and rank the command computes detection metrics (TP/FP/FN, precision/purity, recall/completeness, F1, Jaccard), abundance distances (L1 error, Bray–Curtis), diversity summaries (Shannon index and equitability), Pearson/Spearman correlations, and weighted/unweighted UniFrac differences. Results are written to TSV files so you can load them into spreadsheets or plotting notebooks.
+Evaluate one or more predicted profiles against a ground-truth CAMI table. For every sample and rank the command computes detection metrics (TP/FP/FN, precision/purity, recall/completeness, F1, Jaccard), abundance distances (L1 error, Bray–Curtis), diversity summaries (Shannon index and equitability), Pearson/Spearman correlations, weighted/unweighted UniFrac differences, and the Abundance Rank Error (ARE). Results are written to TSV files so you can load them into spreadsheets or plotting notebooks.
 
 ```bash
 cami benchmark -g truth.cami predictions/profiler1.cami predictions/profiler2.cami \
-  -l "profiler1,profiler2" --gmin 0.01 -n --by-domain \
+  -l "profiler1,profiler2" --af 'a>=0.01' -n --by-domain \
   -o benchmark-results -r "phylum,class,order,family,genus,species"
 ```
 
 - `-g, --ground-truth` selects the reference CAMI table.
 - Positional arguments list predicted profiles to score; provide as many as you like.
 - `-l, --labels` (optional) supplies comma-separated names used in the output. When omitted the command derives labels from the file names.
-- `--gmin` drops ground-truth taxa whose abundance is below the threshold before scoring (e.g., ignore taxa under 1%).
+- `--af` applies the same expression filter to both the ground truth and predicted profiles before scoring (e.g., `--af 'a>=0.01'`).
+- `--gf` filters the ground-truth profile before scoring using the same expression language as `cami filter`.
+- `--pf` applies an expression filter to every predicted profile before metrics are computed.
 - `-n, --normalize` rescales each sample/rank in every profile so positive abundances sum to 100 prior to computing metrics.
 - `--by-domain` produces additional TSV files restricted to Bacteria, Archaea, Eukarya, and Viruses alongside the overall report.
 - `-o, --output` points to the directory where reports such as `benchmark.tsv` and `benchmark_bacteria.tsv` are written.
@@ -151,8 +153,8 @@ cami benchmark -g truth.cami predictions/profiler1.cami predictions/profiler2.ca
 Each TSV contains one row per profile/sample/rank combination:
 
 ```text
-profile   sample   rank     tp  fp  fn  precision  recall   f1        jaccard  l1_error  bray_curtis  shannon_pred  shannon_truth  evenness_pred  evenness_truth  pearson  spearman  weighted_unifrac  unweighted_unifrac
-profiler1 s1       species  42  5   3   0.893617   0.933333  0.913043  0.777778 4.210000  0.021053     2.271111      2.318765       0.932842       0.950112        0.981000 0.975000 0.042000           0.018519
+profile   sample   rank     tp  fp  fn  precision  recall   f1        jaccard  l1_error  bray_curtis  shannon_pred  shannon_truth  evenness_pred  evenness_truth  pearson  spearman  weighted_unifrac  unweighted_unifrac  abundance_rank_error
+profiler1 s1       species  42  5   3   0.893617   0.933333  0.913043  0.777778 4.210000  0.021053     2.271111      2.318765       0.932842       0.950112        0.981000 0.975000 0.042000           0.018519              0.052632
 ```
 
 ## Working with the filter language
