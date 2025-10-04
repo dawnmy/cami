@@ -4,7 +4,7 @@ mod expression;
 mod processing;
 mod taxonomy;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -14,6 +14,7 @@ use commands::{
     list::{self as list_cmd, ListConfig},
     preview::{self as preview_cmd, PreviewConfig},
     renorm::{self as renorm_cmd, RenormConfig},
+    sort::{self as sort_cmd, SortConfig, SortMode, TaxPathField},
 };
 
 #[derive(Parser)]
@@ -87,6 +88,26 @@ enum Commands {
         #[arg(long = "from")]
         from_rank: Option<String>,
     },
+    /// Sort taxa within each rank for every sample
+    Sort {
+        /// Sort by abundance (descending) and drop zero-abundance taxa
+        #[arg(short = 'a', long, conflicts_with = "taxpath")]
+        abundance: bool,
+        /// Sort by taxonomy path (TAXPATH or TAXPATHSN)
+        #[arg(
+            short = 't',
+            value_enum,
+            num_args = 0..=1,
+            default_missing_value = "taxpath"
+        )]
+        taxpath: Option<TaxPathField>,
+        /// Input CAMI file
+        #[arg(value_name = "INPUT", index = 1)]
+        input: Option<PathBuf>,
+        /// Output file (defaults to stdout)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -145,6 +166,26 @@ fn main() -> Result<()> {
                 from_rank: from_rank.as_deref(),
             };
             fillup_cmd::run(&cfg)
+        }
+        Commands::Sort {
+            abundance,
+            taxpath,
+            input,
+            output,
+        } => {
+            let mode = if *abundance {
+                SortMode::Abundance
+            } else if let Some(field) = taxpath {
+                SortMode::TaxPath(*field)
+            } else {
+                bail!("either -a/--abundance or -t must be provided");
+            };
+            let cfg = SortConfig {
+                input: input.as_ref(),
+                output: output.as_ref(),
+                mode,
+            };
+            sort_cmd::run(&cfg)
         }
     }
 }
