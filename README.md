@@ -2,7 +2,6 @@
 
 `cami` is a command-line companion for working with [CAMI](https://cami-challenge.org/file-formats/) taxonomic profiling tables. It helps you inspect samples, clean and reformat abundances, and prepare subsets for downstream analysis without leaving the terminal.
 
-
 ## Feature overview
 
 - Summarize CAMI files to see which samples, ranks, and taxa are present.
@@ -12,7 +11,6 @@
 - Renormalize abundances so that every rank in every sample sums to 100.
 - Reorder taxa within each rank, either by abundance (dropping zeroes) or by lineage, to make tables easier to scan.
 - Benchmark predicted profiles against ground truth tables with precision/recall, abundance error, correlation, diversity, and UniFrac metrics.
-
 
 The repository includes a small demo table at [`examples/test.cami`](examples/test.cami) that you can use with the examples below.
 
@@ -69,7 +67,6 @@ $ cami preview -n 2 examples/test.cami
 ```
 
 ### `cami filter`
-
 
 Filter taxa with boolean expressions while optionally filling missing ranks and renormalizing abundances. Results are emitted as a valid CAMI table, so you can chain additional commands or redirect to a file. It is recommended to use single quotation marks instead of double quotes. For sample ID matching, you can enclose the sample ID or pattern in double quotes within the single-quoted expression. If you use `!c`, you must use single quotes for the expression.
 
@@ -157,7 +154,6 @@ Each TSV contains one row per profile/sample/rank combination:
 profile   sample   rank     tp  fp  fn  precision  recall   f1        jaccard  l1_error  bray_curtis  shannon_pred  shannon_truth  evenness_pred  evenness_truth  pearson  spearman  weighted_unifrac  unweighted_unifrac
 profiler1 s1       species  42  5   3   0.893617   0.933333  0.913043  0.777778 4.210000  0.021053     2.271111      2.318765       0.932842       0.950112        0.981000 0.975000 0.042000           0.018519
 ```
-
 
 ## Working with the filter language
 

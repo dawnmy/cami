@@ -53,8 +53,8 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
             .map(|p| {
                 p.file_stem()
                     .and_then(|s| s.to_str())
-                    .unwrap_or_else(|| p.to_string_lossy().as_ref())
-                    .to_string()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| p.to_string_lossy().into_owned())
             })
             .collect()
     } else {
