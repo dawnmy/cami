@@ -75,11 +75,19 @@ enum Commands {
         )]
         labels: Option<String>,
         #[arg(
-            long = "gmin",
-            value_name = "MIN",
-            help = "Ignore ground truth taxa below this abundance percentage."
+            long = "gf",
+            value_name = "EXPR",
+            help = "Filter expression applied to the ground truth profile before scoring.",
+            long_help = "Expression syntax matches `cami filter`, combining rank (r), sample (s), abundance (a), taxonomy (t/tax), and cumulative-sum (c) predicates with & (and), | (or), and parentheses."
         )]
-        gmin: Option<f64>,
+        ground_filter: Option<String>,
+        #[arg(
+            long = "pf",
+            value_name = "EXPR",
+            help = "Filter expression applied to each predicted profile before scoring.",
+            long_help = "Expression syntax matches `cami filter`, combining rank (r), sample (s), abundance (a), taxonomy (t/tax), and cumulative-sum (c) predicates with & (and), | (or), and parentheses."
+        )]
+        pred_filter: Option<String>,
         #[arg(
             short = 'n',
             long = "normalize",
@@ -262,7 +270,8 @@ fn main() -> Result<()> {
             ground_truth,
             predictions,
             labels,
-            gmin,
+            ground_filter,
+            pred_filter,
             normalize,
             by_domain,
             output,
@@ -274,7 +283,8 @@ fn main() -> Result<()> {
                 ground_truth: ground_truth.clone(),
                 predictions: predictions.clone(),
                 labels: label_vec,
-                gmin: *gmin,
+                ground_filter: ground_filter.clone(),
+                pred_filter: pred_filter.clone(),
                 normalize: *normalize,
                 by_domain: *by_domain,
                 output: output.clone(),

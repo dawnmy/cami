@@ -7,13 +7,16 @@ use anyhow::{Context, Result, bail};
 
 use crate::cami;
 use crate::cami::{Entry, Sample};
+use crate::expression::{apply_filter, expr_needs_taxdump, parse_expression};
+use crate::taxonomy::{Taxonomy, ensure_taxdump};
 
 #[derive(Clone)]
 pub struct BenchmarkConfig {
     pub ground_truth: PathBuf,
     pub predictions: Vec<PathBuf>,
     pub labels: Vec<String>,
-    pub gmin: Option<f64>,
+    pub ground_filter: Option<String>,
+    pub pred_filter: Option<String>,
     pub normalize: bool,
     pub by_domain: bool,
     pub output: PathBuf,
@@ -36,9 +39,44 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
         bail!("labels count must match number of predicted profiles");
     }
 
-    let gt_samples = cami::parse_cami(&cfg.ground_truth)?;
+    let ground_expr = cfg
+        .ground_filter
+        .as_ref()
+        .map(|s| parse_expression(s))
+        .transpose()
+        .context("parsing ground-truth filter expression")?;
+    let pred_expr = cfg
+        .pred_filter
+        .as_ref()
+        .map(|s| parse_expression(s))
+        .transpose()
+        .context("parsing predicted-profile filter expression")?;
+
+    let needs_taxdump = ground_expr
+        .as_ref()
+        .is_some_and(|expr| expr_needs_taxdump(expr))
+        || pred_expr
+            .as_ref()
+            .is_some_and(|expr| expr_needs_taxdump(expr));
+
+    let taxonomy = if needs_taxdump {
+        let dir = taxonomy_dir();
+        ensure_taxdump(&dir).with_context(|| format!("ensuring taxdump in {}", dir.display()))?;
+        Some(Taxonomy::load(&dir)?)
+    } else {
+        None
+    };
+
+    let mut gt_samples = cami::parse_cami(&cfg.ground_truth)?;
     if gt_samples.is_empty() {
         bail!("ground truth profile has no samples");
+    }
+
+    if let Some(expr) = ground_expr.as_ref() {
+        gt_samples = apply_filter(&gt_samples, expr, taxonomy.as_ref());
+        if gt_samples.is_empty() {
+            bail!("ground truth profile has no samples after applying --gf");
+        }
     }
 
     fs::create_dir_all(&cfg.output)
@@ -88,7 +126,6 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
         let gt_map = build_profile_map(
             &gt_samples,
             ranks.as_ref(),
-            cfg.gmin,
             cfg.normalize,
             domain.as_deref(),
         );
@@ -97,11 +134,13 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
         sample_ids.sort();
 
         for (pred_path, label) in cfg.predictions.iter().zip(labels.iter()) {
-            let pred_samples = cami::parse_cami(pred_path)?;
+            let mut pred_samples = cami::parse_cami(pred_path)?;
+            if let Some(expr) = pred_expr.as_ref() {
+                pred_samples = apply_filter(&pred_samples, expr, taxonomy.as_ref());
+            }
             let pred_map = build_profile_map(
                 &pred_samples,
                 ranks.as_ref(),
-                None,
                 cfg.normalize,
                 domain.as_deref(),
             );
@@ -157,7 +196,6 @@ fn canonical_rank(rank: &str) -> Result<String> {
 fn build_profile_map(
     samples: &[Sample],
     ranks: Option<&Vec<String>>,
-    min_threshold: Option<f64>,
     normalize: bool,
     domain: Option<&str>,
 ) -> HashMap<String, HashMap<String, Vec<ProfileEntry>>> {
@@ -170,11 +208,6 @@ fn build_profile_map(
         for entry in &sample.entries {
             if entry.percentage <= 0.0 {
                 continue;
-            }
-            if let Some(threshold) = min_threshold {
-                if entry.percentage < threshold {
-                    continue;
-                }
             }
             if let Some(filter) = &rank_filter {
                 if !filter.contains(&entry.rank) {
@@ -324,7 +357,7 @@ fn compute_metrics(gt_entries: &[ProfileEntry], pred_entries: &[ProfileEntry]) -
     metrics.pearson = pearson(&gt_values, &pred_values);
     metrics.spearman = spearman(&gt_values, &pred_values);
 
-    let (weighted, unweighted) = unifrac(&gt_map, &pred_map, gt_total, pred_total);
+    let (weighted, unweighted) = unifrac(gt_entries, pred_entries, gt_total, pred_total);
     metrics.weighted_unifrac = weighted;
     metrics.unweighted_unifrac = unweighted;
 
@@ -417,53 +450,98 @@ fn rank_values(values: &[f64]) -> Vec<f64> {
 }
 
 fn unifrac(
-    gt_map: &HashMap<String, &ProfileEntry>,
-    pred_map: &HashMap<String, &ProfileEntry>,
+    gt_entries: &[ProfileEntry],
+    pred_entries: &[ProfileEntry],
     gt_total: f64,
     pred_total: f64,
 ) -> (Option<f64>, Option<f64>) {
-    if gt_map.is_empty() && pred_map.is_empty() {
+    let gt_positive: Vec<&ProfileEntry> = gt_entries
+        .iter()
+        .filter(|entry| entry.percentage > 0.0)
+        .collect();
+    let pred_positive: Vec<&ProfileEntry> = pred_entries
+        .iter()
+        .filter(|entry| entry.percentage > 0.0)
+        .collect();
+
+    if gt_positive.is_empty() && pred_positive.is_empty() {
         return (None, None);
     }
 
+    let gt_presence_mass = if gt_positive.is_empty() {
+        0.0
+    } else {
+        1.0 / gt_positive.len() as f64
+    };
+    let pred_presence_mass = if pred_positive.is_empty() {
+        0.0
+    } else {
+        1.0 / pred_positive.len() as f64
+    };
+
     let mut root = TreeNode::default();
 
-    for entry in gt_map.values() {
+    let mut gt_mass_sum = 0.0;
+    let mut pred_mass_sum = 0.0;
+    for entry in &gt_positive {
         let mass = if gt_total > 0.0 {
             entry.percentage / gt_total
         } else {
             0.0
         };
-        if mass <= 0.0 {
-            continue;
-        }
+        gt_mass_sum += mass;
         let parts = split_taxpath(&entry.taxpath);
-        add_mass(&mut root, &parts, 0, mass, true);
+        add_mass(&mut root, &parts, 0, mass, gt_presence_mass, true);
     }
 
-    for entry in pred_map.values() {
+    for entry in &pred_positive {
         let mass = if pred_total > 0.0 {
             entry.percentage / pred_total
         } else {
             0.0
         };
-        if mass <= 0.0 {
-            continue;
-        }
+        pred_mass_sum += mass;
         let parts = split_taxpath(&entry.taxpath);
-        add_mass(&mut root, &parts, 0, mass, false);
+        add_mass(&mut root, &parts, 0, mass, pred_presence_mass, false);
     }
 
-    let (weighted_num, weighted_denom) = weighted_unifrac_contribution(&root);
-    let weighted = if weighted_denom > 0.0 {
-        Some(weighted_num / weighted_denom)
+    if gt_total > 0.0 {
+        let remaining = (1.0 - gt_mass_sum).max(0.0);
+        if remaining > 1e-12 {
+            add_mass(&mut root, &[], 0, remaining, 0.0, true);
+        }
+    } else if gt_positive.is_empty() && pred_mass_sum > 0.0 {
+        add_mass(&mut root, &[], 0, 1.0, 0.0, true);
+    }
+
+    if pred_total > 0.0 {
+        let remaining = (1.0 - pred_mass_sum).max(0.0);
+        if remaining > 1e-12 {
+            add_mass(&mut root, &[], 0, remaining, 0.0, false);
+        }
+    } else if pred_positive.is_empty() && gt_mass_sum > 0.0 {
+        // When the prediction lacks taxa at this rank, place the full mass at the root so
+        // the earth-mover interpretation remains valid.
+        add_mass(&mut root, &[], 0, 1.0, 0.0, false);
+    }
+
+    let (
+        gt_mass,
+        pred_mass,
+        gt_presence_total,
+        pred_presence_total,
+        weighted_cost,
+        unweighted_cost,
+    ) = accumulate_flows(&root);
+
+    let weighted = if gt_mass > 0.0 || pred_mass > 0.0 {
+        Some(weighted_cost)
     } else {
         None
     };
 
-    let (unweighted_num, unweighted_denom) = unweighted_unifrac_contribution(&root);
-    let unweighted = if unweighted_denom > 0.0 {
-        Some(unweighted_num / unweighted_denom)
+    let unweighted = if gt_presence_total > 0.0 || pred_presence_total > 0.0 {
+        Some(unweighted_cost)
     } else {
         None
     };
@@ -476,6 +554,8 @@ struct TreeNode {
     children: HashMap<String, TreeNode>,
     gt_mass: f64,
     pred_mass: f64,
+    gt_presence: f64,
+    pred_presence: f64,
 }
 
 fn split_taxpath(path: &str) -> Vec<String> {
@@ -486,14 +566,22 @@ fn split_taxpath(path: &str) -> Vec<String> {
         .collect()
 }
 
-fn add_mass(node: &mut TreeNode, parts: &[String], idx: usize, mass: f64, is_gt: bool) {
-    if is_gt {
-        node.gt_mass += mass;
-    } else {
-        node.pred_mass += mass;
-    }
-
+fn add_mass(
+    node: &mut TreeNode,
+    parts: &[String],
+    idx: usize,
+    mass: f64,
+    presence: f64,
+    is_gt: bool,
+) {
     if idx >= parts.len() {
+        if is_gt {
+            node.gt_mass += mass;
+            node.gt_presence += presence;
+        } else {
+            node.pred_mass += mass;
+            node.pred_presence += presence;
+        }
         return;
     }
 
@@ -501,39 +589,42 @@ fn add_mass(node: &mut TreeNode, parts: &[String], idx: usize, mass: f64, is_gt:
         .children
         .entry(parts[idx].clone())
         .or_insert_with(TreeNode::default);
-    add_mass(child, parts, idx + 1, mass, is_gt);
+    add_mass(child, parts, idx + 1, mass, presence, is_gt);
 }
 
-fn weighted_unifrac_contribution(node: &TreeNode) -> (f64, f64) {
-    let mut num = 0.0;
-    let mut denom = 0.0;
-    for child in node.children.values() {
-        num += (child.gt_mass - child.pred_mass).abs();
-        denom += child.gt_mass + child.pred_mass;
-        let (child_num, child_denom) = weighted_unifrac_contribution(child);
-        num += child_num;
-        denom += child_denom;
-    }
-    (num, denom)
-}
+fn accumulate_flows(node: &TreeNode) -> (f64, f64, f64, f64, f64, f64) {
+    let mut gt_mass = node.gt_mass;
+    let mut pred_mass = node.pred_mass;
+    let mut gt_presence = node.gt_presence;
+    let mut pred_presence = node.pred_presence;
+    let mut weighted_cost = 0.0;
+    let mut unweighted_cost = 0.0;
 
-fn unweighted_unifrac_contribution(node: &TreeNode) -> (f64, f64) {
-    let mut num = 0.0;
-    let mut denom = 0.0;
     for child in node.children.values() {
-        let gt_present = child.gt_mass > 0.0;
-        let pred_present = child.pred_mass > 0.0;
-        if gt_present || pred_present {
-            denom += 1.0;
-            if gt_present ^ pred_present {
-                num += 1.0;
-            }
-        }
-        let (child_num, child_denom) = unweighted_unifrac_contribution(child);
-        num += child_num;
-        denom += child_denom;
+        let (
+            child_gt_mass,
+            child_pred_mass,
+            child_gt_presence,
+            child_pred_presence,
+            child_weighted_cost,
+            child_unweighted_cost,
+        ) = accumulate_flows(child);
+        weighted_cost += child_weighted_cost + (child_gt_mass - child_pred_mass).abs();
+        unweighted_cost += child_unweighted_cost + (child_gt_presence - child_pred_presence).abs();
+        gt_mass += child_gt_mass;
+        pred_mass += child_pred_mass;
+        gt_presence += child_gt_presence;
+        pred_presence += child_pred_presence;
     }
-    (num, denom)
+
+    (
+        gt_mass,
+        pred_mass,
+        gt_presence,
+        pred_presence,
+        weighted_cost,
+        unweighted_cost,
+    )
 }
 
 fn write_metrics<W: Write>(
@@ -578,4 +669,10 @@ fn format_opt(value: Option<f64>) -> String {
 
 fn format_float(value: f64) -> String {
     format!("{:.5}", value)
+}
+
+fn taxonomy_dir() -> PathBuf {
+    dirs::home_dir()
+        .map(|p| p.join(".cami"))
+        .unwrap_or_else(|| PathBuf::from(".cami"))
 }
