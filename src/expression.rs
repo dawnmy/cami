@@ -174,7 +174,15 @@ fn eval_rank(atom: &str, sample: &Sample, entry: &Entry) -> Option<bool> {
     };
     let rest = rest.trim_start();
     if let Some(v) = rest.strip_prefix("==") {
-        return Some(entry.rank == v.trim());
+        let values: Vec<&str> = v
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if values.is_empty() {
+            return Some(entry.rank == v.trim());
+        }
+        return Some(values.iter().any(|value| entry.rank == *value));
     }
     if let Some(v) = rest.strip_prefix("<=") {
         return Some(rank_compare(sample, &entry.rank, v.trim(), |a, b| a >= b));
@@ -229,13 +237,23 @@ fn match_sample(selector: &str, samples: &[Sample], sample: &Sample, sample_inde
         return true;
     }
     let mut matched = false;
-    for part in selector
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
-        if part.contains(':') {
-            if match_sample_range(part, samples, sample_index) {
+    for part in split_unquoted(selector, ',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if part == ":" || part == "." {
+            matched = true;
+            break;
+        }
+        let colon_parts = split_unquoted(part, ':');
+        if colon_parts.len() == 2 {
+            if match_sample_range_parts(&colon_parts[0], &colon_parts[1], samples, sample_index) {
+                matched = true;
+                break;
+            }
+        } else if colon_parts.len() == 1 {
+            if match_sample_value(&colon_parts[0], samples, sample, sample_index) {
                 matched = true;
                 break;
             }
@@ -253,43 +271,52 @@ fn match_sample_value(
     sample: &Sample,
     sample_index: usize,
 ) -> bool {
-    if let Ok(idx) = value.parse::<usize>() {
-        return idx == sample_index + 1;
+    let Some((parsed, quoted)) = parse_selector_value(value) else {
+        return true;
+    };
+    if !quoted {
+        if let Ok(idx) = parsed.parse::<usize>() {
+            return idx == sample_index + 1;
+        }
     }
-    if let Some(idx) = samples.iter().position(|s| s.id == value) {
+    if let Some(idx) = samples.iter().position(|s| s.id == parsed) {
         return idx == sample_index;
     }
-    value == sample.id
+    parsed == sample.id
 }
 
-fn match_sample_range(range: &str, samples: &[Sample], sample_index: usize) -> bool {
-    let mut parts = range.split(':');
-    let start_raw = parts.next().unwrap_or("").trim();
-    let end_raw = parts.next().unwrap_or("").trim();
+fn match_sample_range_parts(
+    start_raw: &str,
+    end_raw: &str,
+    samples: &[Sample],
+    sample_index: usize,
+) -> bool {
+    let start_val = parse_selector_value(start_raw);
+    let end_val = parse_selector_value(end_raw);
 
-    if start_raw.is_empty() && end_raw.is_empty() {
+    if start_val.is_none() && end_val.is_none() {
         return true;
     }
 
-    let start_idx = start_raw
-        .parse::<usize>()
-        .ok()
-        .map(|n| n.saturating_sub(1))
-        .or_else(|| samples.iter().position(|s| s.id == start_raw));
-    if !start_raw.is_empty() && start_idx.is_none() {
-        return false;
-    }
-    let end_idx = end_raw
-        .parse::<usize>()
-        .ok()
-        .map(|n| n.saturating_sub(1))
-        .or_else(|| samples.iter().position(|s| s.id == end_raw));
-    if !end_raw.is_empty() && end_idx.is_none() {
+    let start_idx = match start_val {
+        Some(ref value) => selector_value_to_index(value, samples),
+        None => Some(0),
+    };
+    if start_val.is_some() && start_idx.is_none() {
         return false;
     }
 
-    let start = start_idx.unwrap_or(0);
-    let end = end_idx.unwrap_or_else(|| samples.len().saturating_sub(1));
+    let end_idx = match end_val {
+        Some(ref value) => selector_value_to_index(value, samples),
+        None => samples.len().checked_sub(1),
+    };
+    if end_val.is_some() && end_idx.is_none() {
+        return false;
+    }
+
+    let (Some(start), Some(end)) = (start_idx, end_idx) else {
+        return false;
+    };
 
     let (low, high) = if start <= end {
         (start, end)
@@ -325,6 +352,68 @@ fn eval_abundance(atom: &str, entry: &Entry) -> Option<bool> {
         return Some(entry.percentage < parse_f64(v.trim()));
     }
     None
+}
+
+fn split_unquoted(input: &str, delimiter: char) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut quote_char = '\0';
+    for ch in input.chars() {
+        match ch {
+            '"' | '\'' => {
+                if in_quotes {
+                    if ch == quote_char {
+                        in_quotes = false;
+                    }
+                } else {
+                    in_quotes = true;
+                    quote_char = ch;
+                }
+                current.push(ch);
+            }
+            _ if ch == delimiter && !in_quotes => {
+                parts.push(current.trim().to_string());
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        parts.push(current.trim().to_string());
+    } else if input.ends_with(delimiter) {
+        parts.push(String::new());
+    }
+    if parts.is_empty() {
+        parts.push(String::new());
+    }
+    parts
+}
+
+fn parse_selector_value(raw: &str) -> Option<(String, bool)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "." {
+        return None;
+    }
+    let first = trimmed.chars().next();
+    let last = trimmed.chars().last();
+    if trimmed.len() >= 2 {
+        if let (Some(f), Some(l)) = (first, last) {
+            if (f == '"' && l == '"') || (f == '\'' && l == '\'') {
+                return Some((trimmed[1..trimmed.len() - 1].to_string(), true));
+            }
+        }
+    }
+    Some((trimmed.to_string(), false))
+}
+
+fn selector_value_to_index(value: &(String, bool), samples: &[Sample]) -> Option<usize> {
+    if !value.1 {
+        if let Ok(idx) = value.0.parse::<usize>() {
+            return Some(idx.saturating_sub(1));
+        }
+    }
+    samples.iter().position(|s| s.id == value.0)
 }
 
 fn parse_f64(s: &str) -> f64 {
