@@ -135,14 +135,15 @@ Evaluate one or more predicted profiles against a ground-truth CAMI table. For e
 
 ```bash
 cami benchmark -g truth.cami predictions/profiler1.cami predictions/profiler2.cami \
-  -l "profiler1,profiler2" --gmin 0.01 -n --by-domain \
+  -l "profiler1,profiler2" --gf 'a>=0.01' -n --by-domain \
   -o benchmark-results -r "phylum,class,order,family,genus,species"
 ```
 
 - `-g, --ground-truth` selects the reference CAMI table.
 - Positional arguments list predicted profiles to score; provide as many as you like.
 - `-l, --labels` (optional) supplies comma-separated names used in the output. When omitted the command derives labels from the file names.
-- `--gmin` drops ground-truth taxa whose abundance is below the threshold before scoring (e.g., ignore taxa under 1%).
+- `--gf` filters the ground-truth profile before scoring using the same expression language as `cami filter` (e.g., `--gf 'a>=0.01'`).
+- `--pf` applies an expression filter to every predicted profile before metrics are computed.
 - `-n, --normalize` rescales each sample/rank in every profile so positive abundances sum to 100 prior to computing metrics.
 - `--by-domain` produces additional TSV files restricted to Bacteria, Archaea, Eukarya, and Viruses alongside the overall report.
 - `-o, --output` points to the directory where reports such as `benchmark.tsv` and `benchmark_bacteria.tsv` are written.
