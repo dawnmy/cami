@@ -18,7 +18,7 @@ The repository includes a small demo table at [`examples/test.cami`](examples/te
 1. Install [Rust](https://www.rust-lang.org/tools/install) if it is not already available.
 2. Clone this repository and build the binary:
    ```bash
-   git clone https://github.com/your-org/cami.git
+   git clone https://github.com/dawnmy/cami.git
    cd cami
    cargo install --path .
    ```
