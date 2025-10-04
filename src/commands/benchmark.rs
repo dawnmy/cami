@@ -25,7 +25,6 @@ struct ProfileEntry {
     taxid: String,
     percentage: f64,
     taxpath: String,
-    taxpathsn: String,
 }
 
 pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
@@ -194,7 +193,6 @@ fn build_profile_map(
                     taxid: entry.taxid.clone(),
                     percentage: entry.percentage,
                     taxpath: entry.taxpath.clone(),
-                    taxpathsn: entry.taxpathsn.clone(),
                 });
         }
 
@@ -261,6 +259,9 @@ fn compute_metrics(gt_entries: &[ProfileEntry], pred_entries: &[ProfileEntry]) -
         }
     }
 
+    let gt_total: f64 = gt_entries.iter().map(|e| e.percentage).sum();
+    let pred_total: f64 = pred_entries.iter().map(|e| e.percentage).sum();
+
     let mut union: BTreeSet<String> = BTreeSet::new();
     for taxid in gt_map.keys() {
         union.insert(taxid.clone());
@@ -278,7 +279,6 @@ fn compute_metrics(gt_entries: &[ProfileEntry], pred_entries: &[ProfileEntry]) -
     for taxid in &union {
         let g = gt_map.get(taxid).map(|e| e.percentage).unwrap_or(0.0);
         let p = pred_map.get(taxid).map(|e| e.percentage).unwrap_or(0.0);
-
         if g > 0.0 && p > 0.0 {
             metrics.tp += 1;
         } else if p > 0.0 {
@@ -286,10 +286,18 @@ fn compute_metrics(gt_entries: &[ProfileEntry], pred_entries: &[ProfileEntry]) -
         } else if g > 0.0 {
             metrics.fn_ += 1;
         }
-        sum_abs += (g - p).abs();
-        sum_tot += g + p;
-        gt_values.push(g);
-        pred_values.push(p);
+
+        let g_norm = if gt_total > 0.0 { g / gt_total } else { 0.0 };
+        let p_norm = if pred_total > 0.0 {
+            p / pred_total
+        } else {
+            0.0
+        };
+
+        sum_abs += (g_norm - p_norm).abs();
+        sum_tot += g_norm + p_norm;
+        gt_values.push(g_norm);
+        pred_values.push(p_norm);
     }
 
     metrics.l1_error = sum_abs;
@@ -316,7 +324,7 @@ fn compute_metrics(gt_entries: &[ProfileEntry], pred_entries: &[ProfileEntry]) -
     metrics.pearson = pearson(&gt_values, &pred_values);
     metrics.spearman = spearman(&gt_values, &pred_values);
 
-    let (weighted, unweighted) = unifrac(&gt_map, &pred_map);
+    let (weighted, unweighted) = unifrac(&gt_map, &pred_map, gt_total, pred_total);
     metrics.weighted_unifrac = weighted;
     metrics.unweighted_unifrac = unweighted;
 
@@ -411,61 +419,121 @@ fn rank_values(values: &[f64]) -> Vec<f64> {
 fn unifrac(
     gt_map: &HashMap<String, &ProfileEntry>,
     pred_map: &HashMap<String, &ProfileEntry>,
+    gt_total: f64,
+    pred_total: f64,
 ) -> (Option<f64>, Option<f64>) {
-    let mut nodes: HashMap<String, (f64, f64)> = HashMap::new();
+    if gt_map.is_empty() && pred_map.is_empty() {
+        return (None, None);
+    }
+
+    let mut root = TreeNode::default();
+
     for entry in gt_map.values() {
-        for node in lineage_nodes(&entry.taxpath) {
-            let e = nodes.entry(node).or_insert((0.0, 0.0));
-            e.0 += entry.percentage;
+        let mass = if gt_total > 0.0 {
+            entry.percentage / gt_total
+        } else {
+            0.0
+        };
+        if mass <= 0.0 {
+            continue;
         }
+        let parts = split_taxpath(&entry.taxpath);
+        add_mass(&mut root, &parts, 0, mass, true);
     }
+
     for entry in pred_map.values() {
-        for node in lineage_nodes(&entry.taxpath) {
-            let e = nodes.entry(node).or_insert((0.0, 0.0));
-            e.1 += entry.percentage;
+        let mass = if pred_total > 0.0 {
+            entry.percentage / pred_total
+        } else {
+            0.0
+        };
+        if mass <= 0.0 {
+            continue;
         }
+        let parts = split_taxpath(&entry.taxpath);
+        add_mass(&mut root, &parts, 0, mass, false);
     }
 
-    let mut sum_diff = 0.0;
-    let mut sum_total = 0.0;
-    let mut presence_diff = 0.0;
-    let mut presence_total = 0.0;
-
-    for (_node, (g, p)) in nodes {
-        let has_g = g > 0.0;
-        let has_p = p > 0.0;
-        if has_g || has_p {
-            sum_diff += (g - p).abs();
-            sum_total += g + p;
-            presence_total += 1.0;
-            if has_g ^ has_p {
-                presence_diff += 1.0;
-            }
-        }
-    }
-
-    let weighted = if sum_total > 0.0 {
-        Some(sum_diff / sum_total)
+    let (weighted_num, weighted_denom) = weighted_unifrac_contribution(&root);
+    let weighted = if weighted_denom > 0.0 {
+        Some(weighted_num / weighted_denom)
     } else {
         None
     };
-    let unweighted = if presence_total > 0.0 {
-        Some(presence_diff / presence_total)
+
+    let (unweighted_num, unweighted_denom) = unweighted_unifrac_contribution(&root);
+    let unweighted = if unweighted_denom > 0.0 {
+        Some(unweighted_num / unweighted_denom)
     } else {
         None
     };
+
     (weighted, unweighted)
 }
 
-fn lineage_nodes(path: &str) -> Vec<String> {
-    let mut nodes = Vec::new();
-    let parts: Vec<&str> = path.split('|').filter(|p| !p.is_empty()).collect();
-    let mut current: Vec<&str> = Vec::new();
-    for part in parts {
-        current.push(part);
-        nodes.push(current.join("|"));
+#[derive(Default)]
+struct TreeNode {
+    children: HashMap<String, TreeNode>,
+    gt_mass: f64,
+    pred_mass: f64,
+}
+
+fn split_taxpath(path: &str) -> Vec<String> {
+    path.split('|')
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty())
+        .map(|part| part.to_string())
+        .collect()
+}
+
+fn add_mass(node: &mut TreeNode, parts: &[String], idx: usize, mass: f64, is_gt: bool) {
+    if is_gt {
+        node.gt_mass += mass;
+    } else {
+        node.pred_mass += mass;
     }
-    nodes
+
+    if idx >= parts.len() {
+        return;
+    }
+
+    let child = node
+        .children
+        .entry(parts[idx].clone())
+        .or_insert_with(TreeNode::default);
+    add_mass(child, parts, idx + 1, mass, is_gt);
+}
+
+fn weighted_unifrac_contribution(node: &TreeNode) -> (f64, f64) {
+    let mut num = 0.0;
+    let mut denom = 0.0;
+    for child in node.children.values() {
+        num += (child.gt_mass - child.pred_mass).abs();
+        denom += child.gt_mass + child.pred_mass;
+        let (child_num, child_denom) = weighted_unifrac_contribution(child);
+        num += child_num;
+        denom += child_denom;
+    }
+    (num, denom)
+}
+
+fn unweighted_unifrac_contribution(node: &TreeNode) -> (f64, f64) {
+    let mut num = 0.0;
+    let mut denom = 0.0;
+    for child in node.children.values() {
+        let gt_present = child.gt_mass > 0.0;
+        let pred_present = child.pred_mass > 0.0;
+        if gt_present || pred_present {
+            denom += 1.0;
+            if gt_present ^ pred_present {
+                num += 1.0;
+            }
+        }
+        let (child_num, child_denom) = unweighted_unifrac_contribution(child);
+        num += child_num;
+        denom += child_denom;
+    }
+    (num, denom)
 }
 
 fn write_metrics<W: Write>(
@@ -509,5 +577,5 @@ fn format_opt(value: Option<f64>) -> String {
 }
 
 fn format_float(value: f64) -> String {
-    format!("{:.6}", value)
+    format!("{:.5}", value)
 }
