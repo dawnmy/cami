@@ -1,6 +1,6 @@
 # cami
 
-cami is a command-line companion for working with [CAMI](https://github.com/biobakery/MetaPhlAn/wiki/CAMI-profiling-format) taxonomic profiling tables. It helps you inspect samples, clean and reformat abundances, and prepare subsets for downstream analysis without leaving the terminal.
+cami is a command-line companion for working with [CAMI](https://cami-challenge.org/file-formats/) taxonomic profiling tables. It helps you inspect samples, clean and reformat abundances, and prepare subsets for downstream analysis without leaving the terminal.
 
 ## Feature overview
 
@@ -67,12 +67,12 @@ $ cami preview -n 2 examples/test.cami
 
 ### `cami filter`
 
-Filter taxa with boolean expressions while optionally filling missing ranks and renormalizing abundances. Results are emitted as a valid CAMI table, so you can chain additional commands or redirect to a file.
+Filter taxa with boolean expressions while optionally filling missing ranks and renormalizing abundances. Results are emitted as a valid CAMI table, so you can chain additional commands or redirect to a file. It is recommended to use single quotation marks instead of double quotes. For sample ID matching, you can enclose the sample ID or pattern in double quotes within the single-quoted expression. If you use `!c`, you must use single quotes for the expression.
 
 Common workflow:
 
 ```bash
-cami filter --fill-up --renorm "s==s1 & r==species & a>=5" examples/test.cami > enriched.cami
+cami filter --fill-up --renorm 's==s1 & r==species & a>=5' examples/test.cami > enriched.cami
 ```
 
 This keeps species-level entries from sample `s1` that are at least 5% abundant, fills in any missing higher ranks using the NCBI taxonomy, renormalizes each rank to 100%, and writes the output to `enriched.cami`.
@@ -84,7 +84,7 @@ Write expressions with `&` (and), `|` (or), and parentheses. Each atom targets o
 | Atom | Purpose | Operators | Notes |
 | ---- | ------- | --------- | ----- |
 | `r` or `rank` | Match entry ranks | `==`, `!=`, `<=`, `<`, `>=`, `>` | Uses the order declared by `@Ranks`. `r<=class` keeps class and more specific ranks, while `r>class` keeps more general ranks. Comma-separated lists are allowed with `==`/`!=`. |
-| `s` or `sample` | Select samples | `==`, `!=`, `~` | `==` accepts sample IDs, 1-based indices, comma-separated lists, and inclusive ranges (`s==1:3`). `.` or `:` match all samples. Use `s~'regex'` to match IDs with a regular expression. |
+| `s` or `sample` | Select samples | `==`, `!=`, `~` | `==` accepts sample IDs, 1-based indices, comma-separated lists, and inclusive ranges (`s==1:3`). `.` or `:` match all samples. Use `s~"regex"` to match IDs with a regular expression. |
 | `a` or `abundance` | Compare abundances | `==`, `!=`, `>=`, `>`, `<=`, `<` | Values are interpreted as percentages (0–100). |
 | `t` or `tax` | Test lineage membership | `==`, `!=`, `<=`, `<` | Compares against TAXID values. With `--fill-up` or when taxonomy data is available, ancestors are resolved through the NCBI taxdump; otherwise the command inspects `TAXPATH`. Prefix with `!` to negate the result. |
 | `c` or `cumsum` | Filter by cumulative abundance | `<=` | Keeps the least-abundant taxa within each rank whose cumulative sum is at most the threshold (again using percentage units). Prefix with `!` to discard those instead. |
@@ -92,7 +92,7 @@ Write expressions with `&` (and), `|` (or), and parentheses. Each atom targets o
 Examples:
 
 - `r==species & a>=1` keeps species entries that are at least 1% abundant.
-- `s==1,3-5 | s~'^gut'` keeps explicit samples plus any whose IDs start with `gut`.
+- `s==1,3-5 | s~"^gut"` keeps explicit samples plus any whose IDs start with `gut`.
 - `t<=562` keeps entries that fall under *Escherichia coli* (taxid 562) or match the taxid exactly.
 - `!c<=2` removes the lowest-abundance taxa per rank whose cumulative total is at most 2%.
 
@@ -132,10 +132,10 @@ cami sort --taxpathsn examples/test.cami > lineage_sorted.cami
 
 Expressions can be combined freely, allowing complex workflows:
 
-- **Focus on a cohort:** `cami filter "s~'^trial_' & r<=genus" table.cami`
-- **Drop rare tails:** `cami filter "!c<=2" table.cami`
-- **Isolate a lineage:** `cami filter "t<=1224 & r>=phylum" table.cami`
-- **Chain post-processing:** `cami filter --fill-up --renorm "r==species & a>=1" table.cami | cami sort --abundance`
+- **Focus on a cohort:** `cami filter 's~"^trial_" & r<=genus' table.cami`
+- **Drop rare tails:** `cami filter '!c<=2' table.cami`
+- **Isolate a lineage:** `cami filter 't<=1224 & r>=phylum' table.cami`
+- **Chain post-processing:** `cami filter --fill-up --renorm 'r==species & a>=1' table.cami | cami sort --abundance`
 
 Remember that each command reads from stdin when no input path is supplied and writes to stdout by default, making it easy to compose multiple steps.
 
@@ -143,6 +143,3 @@ Remember that each command reads from stdin when no input path is supplied and w
 
 Commands that require lineage information (`filter --fill-up`, `fillup`) download the NCBI taxdump once and cache it under `~/.cami`. Subsequent runs reuse the cached files. You can remove the directory to force a refresh.
 
-## License
-
-This project is distributed under the terms specified in the repository. See the accompanying license file for details.
