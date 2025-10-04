@@ -1,6 +1,9 @@
 use crate::cami::{Entry, Sample};
 use crate::taxonomy::{Taxonomy, parse_taxid};
 use anyhow::{Result, anyhow};
+use regex::Regex;
+use std::cmp::Ordering;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub enum Expr {
@@ -101,20 +104,60 @@ pub fn expr_needs_taxdump(expr: &Expr) -> bool {
 }
 
 pub fn apply_filter(samples: &[Sample], expr: &Expr, taxonomy: Option<&Taxonomy>) -> Vec<Sample> {
+    let cumsums = compute_cumsums(samples);
     let mut filtered = Vec::new();
     for (sample_index, sample) in samples.iter().enumerate() {
         let mut ns = sample.clone();
-        ns.entries = ns
-            .entries
-            .iter()
-            .cloned()
-            .filter(|entry| eval_expr(expr, samples, sample, entry, sample_index, taxonomy))
-            .collect();
+        ns.entries.clear();
+        for (entry_index, entry) in sample.entries.iter().enumerate() {
+            if eval_expr(
+                expr,
+                samples,
+                sample,
+                entry,
+                sample_index,
+                entry_index,
+                taxonomy,
+                &cumsums,
+            ) {
+                ns.entries.push(entry.clone());
+            }
+        }
         if !ns.entries.is_empty() {
             filtered.push(ns);
         }
     }
     filtered
+}
+
+fn compute_cumsums(samples: &[Sample]) -> Vec<Vec<f64>> {
+    samples
+        .iter()
+        .map(|sample| {
+            let mut by_rank: HashMap<&str, Vec<(usize, f64)>> = HashMap::new();
+            for (idx, entry) in sample.entries.iter().enumerate() {
+                by_rank
+                    .entry(entry.rank.as_str())
+                    .or_default()
+                    .push((idx, entry.percentage));
+            }
+
+            let mut cumsums = vec![0.0; sample.entries.len()];
+            for entries in by_rank.values_mut() {
+                entries.sort_by(|a, b| {
+                    a.1.partial_cmp(&b.1)
+                        .unwrap_or(Ordering::Equal)
+                        .then_with(|| a.0.cmp(&b.0))
+                });
+                let mut running = 0.0;
+                for (idx, value) in entries.iter() {
+                    running += value;
+                    cumsums[*idx] = running;
+                }
+            }
+            cumsums
+        })
+        .collect()
 }
 
 fn eval_expr(
@@ -123,18 +166,63 @@ fn eval_expr(
     sample: &Sample,
     entry: &Entry,
     sample_index: usize,
+    entry_index: usize,
     taxonomy: Option<&Taxonomy>,
+    cumsums: &[Vec<f64>],
 ) -> bool {
     match e {
         Expr::And(a, b) => {
-            eval_expr(a, samples, sample, entry, sample_index, taxonomy)
-                && eval_expr(b, samples, sample, entry, sample_index, taxonomy)
+            eval_expr(
+                a,
+                samples,
+                sample,
+                entry,
+                sample_index,
+                entry_index,
+                taxonomy,
+                cumsums,
+            ) && eval_expr(
+                b,
+                samples,
+                sample,
+                entry,
+                sample_index,
+                entry_index,
+                taxonomy,
+                cumsums,
+            )
         }
         Expr::Or(a, b) => {
-            eval_expr(a, samples, sample, entry, sample_index, taxonomy)
-                || eval_expr(b, samples, sample, entry, sample_index, taxonomy)
+            eval_expr(
+                a,
+                samples,
+                sample,
+                entry,
+                sample_index,
+                entry_index,
+                taxonomy,
+                cumsums,
+            ) || eval_expr(
+                b,
+                samples,
+                sample,
+                entry,
+                sample_index,
+                entry_index,
+                taxonomy,
+                cumsums,
+            )
         }
-        Expr::Atom(s) => eval_atom(s, samples, sample, entry, sample_index, taxonomy),
+        Expr::Atom(s) => eval_atom(
+            s,
+            samples,
+            sample,
+            entry,
+            sample_index,
+            entry_index,
+            taxonomy,
+            cumsums,
+        ),
     }
 }
 
@@ -144,7 +232,9 @@ fn eval_atom(
     sample: &Sample,
     entry: &Entry,
     sample_index: usize,
+    entry_index: usize,
     taxonomy: Option<&Taxonomy>,
+    cumsums: &[Vec<f64>],
 ) -> bool {
     let atom = atom.trim();
 
@@ -160,6 +250,9 @@ fn eval_atom(
     if let Some(res) = eval_tax(atom, entry, taxonomy) {
         return res;
     }
+    if let Some(res) = eval_cumsum(atom, sample_index, entry_index, cumsums) {
+        return res;
+    }
 
     false
 }
@@ -173,6 +266,17 @@ fn eval_rank(atom: &str, sample: &Sample, entry: &Entry) -> Option<bool> {
         return None;
     };
     let rest = rest.trim_start();
+    if let Some(v) = rest.strip_prefix("!=") {
+        let values: Vec<&str> = v
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if values.is_empty() {
+            return Some(entry.rank != v.trim());
+        }
+        return Some(values.iter().all(|value| entry.rank != *value));
+    }
     if let Some(v) = rest.strip_prefix("==") {
         let values: Vec<&str> = v
             .split(',')
@@ -229,6 +333,12 @@ fn eval_sample(
     if let Some(v) = rest.strip_prefix("==") {
         return Some(match_sample(v.trim(), samples, sample, sample_index));
     }
+    if let Some(v) = rest.strip_prefix("!=") {
+        return Some(!match_sample(v.trim(), samples, sample, sample_index));
+    }
+    if let Some(v) = rest.strip_prefix('~') {
+        return Some(match_sample_regex(v.trim(), sample));
+    }
     None
 }
 
@@ -263,6 +373,18 @@ fn match_sample(selector: &str, samples: &[Sample], sample: &Sample, sample_inde
         }
     }
     matched
+}
+
+fn match_sample_regex(pattern_raw: &str, sample: &Sample) -> bool {
+    let Some((pattern, _quoted)) = parse_selector_value(pattern_raw) else {
+        return false;
+    };
+    if pattern.is_empty() {
+        return false;
+    }
+    Regex::new(&pattern)
+        .map(|re| re.is_match(&sample.id))
+        .unwrap_or(false)
 }
 
 fn match_sample_value(
@@ -345,6 +467,10 @@ fn eval_abundance(atom: &str, entry: &Entry) -> Option<bool> {
         let target = parse_f64(v.trim());
         return Some((entry.percentage - target).abs() < 1e-9);
     }
+    if let Some(v) = rest.strip_prefix("!=") {
+        let target = parse_f64(v.trim());
+        return Some((entry.percentage - target).abs() >= 1e-9);
+    }
     if let Some(v) = rest.strip_prefix('>') {
         return Some(entry.percentage > parse_f64(v.trim()));
     }
@@ -352,6 +478,44 @@ fn eval_abundance(atom: &str, entry: &Entry) -> Option<bool> {
         return Some(entry.percentage < parse_f64(v.trim()));
     }
     None
+}
+
+fn eval_cumsum(
+    atom: &str,
+    sample_index: usize,
+    entry_index: usize,
+    cumsums: &[Vec<f64>],
+) -> Option<bool> {
+    let mut working = atom.trim();
+    let mut negate = false;
+    while let Some(rest) = working.strip_prefix('!') {
+        negate = !negate;
+        working = rest.trim_start();
+    }
+
+    let rest = if let Some(r) = working.strip_prefix("cumsum") {
+        r
+    } else if let Some(r) = working.strip_prefix('c') {
+        r
+    } else {
+        return None;
+    };
+
+    let rest = rest.trim_start();
+    if let Some(v) = rest.strip_prefix("<=") {
+        let threshold = parse_f64(v.trim());
+        if let Some(value) = cumsums
+            .get(sample_index)
+            .and_then(|v| v.get(entry_index))
+            .copied()
+        {
+            let result = value <= threshold + 1e-12;
+            return Some(if negate { !result } else { result });
+        }
+        return Some(false);
+    }
+
+    Some(false)
 }
 
 fn split_unquoted(input: &str, delimiter: char) -> Vec<String> {
@@ -437,7 +601,11 @@ fn eval_tax(atom: &str, entry: &Entry, taxonomy: Option<&Taxonomy>) -> Option<bo
     };
 
     let rest = rest.trim_start();
-    let (op, value) = if let Some(v) = rest.strip_prefix("==") {
+    let mut invert_op = false;
+    let (op, value) = if let Some(v) = rest.strip_prefix("!=") {
+        invert_op = true;
+        ("==", v.trim())
+    } else if let Some(v) = rest.strip_prefix("==") {
         ("==", v.trim())
     } else if let Some(v) = rest.strip_prefix("<=") {
         ("<=", v.trim())
@@ -452,6 +620,7 @@ fn eval_tax(atom: &str, entry: &Entry, taxonomy: Option<&Taxonomy>) -> Option<bo
     } else {
         eval_taxpath(entry, op, value)
     };
+    let result = if invert_op { !result } else { result };
     Some(if negate { !result } else { result })
 }
 

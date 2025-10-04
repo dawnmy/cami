@@ -4,94 +4,284 @@ mod expression;
 mod processing;
 mod taxonomy;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 use commands::{
+    benchmark::{self as benchmark_cmd, BenchmarkConfig as BenchmarkRunConfig},
     fillup::{self as fillup_cmd, FillupConfig},
     filter::{self as filter_cmd, FilterConfig},
     list::{self as list_cmd, ListConfig},
     preview::{self as preview_cmd, PreviewConfig},
     renorm::{self as renorm_cmd, RenormConfig},
+    sort::{self as sort_cmd, SortConfig, SortMode, TaxPathField},
 };
 
 #[derive(Parser)]
-#[command(author, version, about)]
+#[command(
+    author,
+    version,
+    about = "Explore and post-process CAMI profiling tables",
+    long_about = "cami reads CAMI-format abundance tables and provides commands to inspect, filter, and reshape them.",
+    disable_help_subcommand = true
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
 }
 
+fn split_labels(input: &str) -> Vec<String> {
+    input
+        .split(',')
+        .map(|part| part.trim().to_string())
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+fn split_ranks(input: &str) -> Vec<String> {
+    input
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .map(|part| part.trim().to_string())
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
 #[derive(Subcommand)]
 enum Commands {
-    /// Filter CAMI profiling data
+    #[command(
+        about = "Benchmark predicted profiles against a ground truth",
+        long_about = "Compare predicted CAMI abundance tables to a ground truth profile per sample and rank. Reports TP/FP/FN counts, precision (purity), recall (completeness), F1-score, Jaccard index, L1 error, Bray-Curtis distance, Shannon diversity, equitability, Pearson and Spearman correlations, plus weighted and unweighted UniFrac differences."
+    )]
+    Benchmark {
+        #[arg(
+            short = 'g',
+            long = "ground-truth",
+            value_name = "FILE",
+            help = "Ground truth CAMI profile to evaluate against."
+        )]
+        ground_truth: PathBuf,
+        #[arg(
+            value_name = "PREDICTED",
+            num_args = 1..,
+            help = "Predicted CAMI profiles to benchmark."
+        )]
+        predictions: Vec<PathBuf>,
+        #[arg(
+            short = 'l',
+            long = "labels",
+            value_name = "LABELS",
+            help = "Comma-separated labels for the predicted profiles."
+        )]
+        labels: Option<String>,
+        #[arg(
+            long = "gmin",
+            value_name = "MIN",
+            help = "Ignore ground truth taxa below this abundance percentage."
+        )]
+        gmin: Option<f64>,
+        #[arg(
+            short = 'n',
+            long = "normalize",
+            help = "Normalize abundances within each sample/rank to 100 before scoring."
+        )]
+        normalize: bool,
+        #[arg(
+            long = "by-domain",
+            help = "Also write domain-specific reports for Bacteria, Archaea, Eukarya, and Viruses."
+        )]
+        by_domain: bool,
+        #[arg(
+            short = 'o',
+            long = "output",
+            value_name = "DIR",
+            help = "Directory where benchmark TSV reports will be written."
+        )]
+        output: PathBuf,
+        #[arg(
+            short = 'r',
+            long = "ranks",
+            value_name = "RANKS",
+            help = "Comma-separated list of ranks to evaluate (mix short and full names)."
+        )]
+        ranks: Option<String>,
+    },
+    #[command(
+        about = "Filter CAMI profiling data with logical expressions",
+        long_about = "Apply boolean filter expressions to CAMI profiling tables. Combine rank, sample, abundance, taxonomy, and cumulative-sum predicates with & (and), | (or), and parentheses. When --fill-up is provided the command completes missing lineages using the NCBI taxdump before writing a filtered CAMI table."
+    )]
     Filter {
-        /// Filter expression, e.g. "r==species & a>=0.1"
+        #[arg(
+            value_name = "EXPR",
+            help = "Filter expression combining rank (r), sample (s), abundance (a), taxonomy (t/tax), and cumsum (c) tests.",
+            long_help = concat!(
+                "Filter expression combining rank (r), sample (s), abundance (a), taxonomy (t/tax), and cumulative-sum tests. Use & (and), | (or), and parentheses.\n\n",
+                "Rank selectors: r==rank, r!=rank, r<=rank (current or more specific), r>=rank (current or more general), and range comparisons follow the order declared in @Ranks.\n",
+                "Sample selectors: s==id accepts IDs, 1-based indices, comma-separated lists, or inclusive ranges (e.g. s==1:3); use '.' or ':' for all samples; s!= negates; s~'regex' matches sample IDs with a regular expression.\n",
+                "Abundance selectors: a>=value, a<=value, a>value, a<value, a==value, and a!=value compare percentages.\n",
+                "Taxonomy selectors: t==taxid, t!=taxid, t<=taxid (ancestor or self), t<taxid (strict ancestor); prefix with ! to invert.\n",
+                "Cumulative sums: c<=threshold keeps the least-abundant taxa per rank whose cumulative percentage is within the threshold; prefix with ! to discard them instead."
+            )
+        )]
         expression: String,
-        /// Output file (defaults to stdout)
-        #[arg(short, long)]
+        #[arg(short, long, help = "Write output to a file instead of stdout.")]
         output: Option<PathBuf>,
-        /// Fill up missing higher ranks using NCBI taxdump (downloads to ~/.cami)
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Fill in missing higher ranks using the NCBI taxdump (downloaded to ~/.cami if absent)."
+        )]
         fill_up: bool,
-        /// Source rank to aggregate from when filling up (defaults to species if present)
-        #[arg(long = "from")]
+        #[arg(
+            long = "from",
+            help = "Rank to aggregate from when filling (defaults to species when available)."
+        )]
         from_rank: Option<String>,
-        /// Target rank to fill up to (inclusive)
-        #[arg(long, default_value = "phylum")]
+        #[arg(
+            long,
+            default_value = "phylum",
+            help = "Highest rank to build during fill-up (inclusive)."
+        )]
         to_rank: String,
-        /// Renormalize percentages to 100 per rank after filtering/filling
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Renormalize each rank to 100% after filtering and filling."
+        )]
         renorm: bool,
-        /// Input CAMI file
-        #[arg(value_name = "INPUT", index = 2)]
+        #[arg(
+            value_name = "INPUT",
+            index = 2,
+            help = "Input CAMI file (defaults to stdin)."
+        )]
         input: Option<PathBuf>,
     },
-    /// List samples and per-rank summaries
+    #[command(
+        about = "List samples and per-rank summaries",
+        long_about = "Report each sample's declared ranks, total taxa, and the summed abundance at every rank so you can spot coverage gaps before further processing."
+    )]
     List {
-        /// Input CAMI file
-        #[arg(value_name = "INPUT", index = 1)]
+        #[arg(
+            value_name = "INPUT",
+            index = 1,
+            help = "Input CAMI file (defaults to stdin)."
+        )]
         input: Option<PathBuf>,
     },
-    /// Preview first N entries per sample
+    #[command(
+        about = "Preview the first entries per sample",
+        long_about = "Show the first N taxonomic entries for each sample, preserving the CAMI header format so you can quickly verify parsing and taxonomy strings."
+    )]
     Preview {
-        /// Number of entries per sample to show
-        #[arg(short = 'n', long, default_value_t = 5)]
+        #[arg(
+            short = 'n',
+            long,
+            default_value_t = 5,
+            help = "Number of entries per sample to display.",
+            value_name = "N"
+        )]
         n: usize,
-        /// Input CAMI file
-        #[arg(value_name = "INPUT", index = 1)]
+        #[arg(
+            value_name = "INPUT",
+            index = 1,
+            help = "Input CAMI file (defaults to stdin)."
+        )]
         input: Option<PathBuf>,
     },
-    /// Renormalize abundances to 100 per rank for each sample
+    #[command(
+        about = "Renormalize abundances per rank",
+        long_about = "Scale positive abundances within each rank of every sample so they sum to 100 and round the results to five decimal places."
+    )]
     Renorm {
-        /// Input CAMI file
-        #[arg(value_name = "INPUT", index = 1)]
+        #[arg(
+            value_name = "INPUT",
+            index = 1,
+            help = "Input CAMI file (defaults to stdin)."
+        )]
         input: Option<PathBuf>,
-        /// Output file (defaults to stdout)
-        #[arg(short, long)]
+        #[arg(short, long, help = "Write output to a file instead of stdout.")]
         output: Option<PathBuf>,
     },
-    /// Fill up samples to populate missing ranks using taxonomy lineages
+    #[command(
+        about = "Fill missing ranks using taxonomy",
+        long_about = "Complete partial lineages in each sample by consulting the NCBI taxdump. Newly created abundances are rounded to five decimal places so the output stays tidy."
+    )]
     Fillup {
-        /// Input CAMI file
-        #[arg(value_name = "INPUT", index = 1)]
+        #[arg(
+            value_name = "INPUT",
+            index = 1,
+            help = "Input CAMI file (defaults to stdin)."
+        )]
         input: Option<PathBuf>,
-        /// Output file (defaults to stdout)
-        #[arg(short, long)]
+        #[arg(short, long, help = "Write output to a file instead of stdout.")]
         output: Option<PathBuf>,
-        /// Target rank to fill to (inclusive). Defaults to the highest declared rank
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Highest rank to fill to (inclusive); defaults to the first declared rank."
+        )]
         to_rank: Option<String>,
-        /// Source rank to aggregate from when filling up (defaults to species if present)
-        #[arg(long = "from")]
+        #[arg(
+            long = "from",
+            help = "Rank to aggregate from when filling (defaults to species when available)."
+        )]
         from_rank: Option<String>,
+    },
+    #[command(
+        about = "Sort taxa within each rank",
+        long_about = "Reorder taxa in every sample either by decreasing abundance (dropping zero-abundance entries) or by their taxonomy paths so related lineages stay adjacent."
+    )]
+    Sort {
+        #[arg(
+            short = 'a',
+            long,
+            conflicts_with = "taxpath",
+            help = "Sort taxa by descending abundance and drop entries with zero abundance."
+        )]
+        abundance: bool,
+        #[arg(
+            short = 't',
+            value_enum,
+            num_args = 0..=1,
+            default_missing_value = "taxpath",
+            help = "Sort taxa by their taxonomy path (TAXPATH or TAXPATHSN)."
+        )]
+        taxpath: Option<TaxPathField>,
+        #[arg(
+            value_name = "INPUT",
+            index = 1,
+            help = "Input CAMI file (defaults to stdin)."
+        )]
+        input: Option<PathBuf>,
+        #[arg(short, long, help = "Write output to a file instead of stdout.")]
+        output: Option<PathBuf>,
     },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match &cli.command {
+        Commands::Benchmark {
+            ground_truth,
+            predictions,
+            labels,
+            gmin,
+            normalize,
+            by_domain,
+            output,
+            ranks,
+        } => {
+            let label_vec = labels.as_ref().map(|s| split_labels(s)).unwrap_or_default();
+            let rank_vec = ranks.as_ref().map(|s| split_ranks(s));
+            let cfg = BenchmarkRunConfig {
+                ground_truth: ground_truth.clone(),
+                predictions: predictions.clone(),
+                labels: label_vec,
+                gmin: *gmin,
+                normalize: *normalize,
+                by_domain: *by_domain,
+                output: output.clone(),
+                ranks: rank_vec,
+            };
+            benchmark_cmd::run(&cfg)
+        }
         Commands::Filter {
             expression,
             output,
@@ -145,6 +335,26 @@ fn main() -> Result<()> {
                 from_rank: from_rank.as_deref(),
             };
             fillup_cmd::run(&cfg)
+        }
+        Commands::Sort {
+            abundance,
+            taxpath,
+            input,
+            output,
+        } => {
+            let mode = if *abundance {
+                SortMode::Abundance
+            } else if let Some(field) = taxpath {
+                SortMode::TaxPath(*field)
+            } else {
+                bail!("either -a/--abundance or -t must be provided");
+            };
+            let cfg = SortConfig {
+                input: input.as_ref(),
+                output: output.as_ref(),
+                mode,
+            };
+            sort_cmd::run(&cfg)
         }
     }
 }
