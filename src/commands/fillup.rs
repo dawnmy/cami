@@ -1,5 +1,5 @@
 use crate::cami::{load_samples, open_output, write_cami};
-use crate::processing::{fill_up_default, fill_up_to};
+use crate::processing::{fill_up_default, fill_up_to, round_percentages};
 use crate::taxonomy::{Taxonomy, ensure_taxdump};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -22,6 +22,8 @@ pub fn run(cfg: &FillupConfig) -> Result<()> {
     } else {
         fill_up_default(&mut samples, cfg.from_rank, &taxonomy);
     }
+
+    round_percentages(&mut samples);
 
     let mut out = open_output(cfg.output)?;
     write_cami(&samples, &mut *out)?;

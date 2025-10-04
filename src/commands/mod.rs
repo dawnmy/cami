@@ -3,3 +3,4 @@ pub mod filter;
 pub mod list;
 pub mod preview;
 pub mod renorm;
+pub mod sort;
