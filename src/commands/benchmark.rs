@@ -1,9 +1,10 @@
+use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 
 use crate::cami;
 use crate::cami::{Entry, Sample};
@@ -15,6 +16,7 @@ pub struct BenchmarkConfig {
     pub ground_truth: PathBuf,
     pub predictions: Vec<PathBuf>,
     pub labels: Vec<String>,
+    pub all_filter: Option<String>,
     pub ground_filter: Option<String>,
     pub pred_filter: Option<String>,
     pub normalize: bool,
@@ -39,6 +41,12 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
         bail!("labels count must match number of predicted profiles");
     }
 
+    let all_expr = cfg
+        .all_filter
+        .as_ref()
+        .map(|s| parse_expression(s))
+        .transpose()
+        .context("parsing global filter expression")?;
     let ground_expr = cfg
         .ground_filter
         .as_ref()
@@ -52,9 +60,12 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
         .transpose()
         .context("parsing predicted-profile filter expression")?;
 
-    let needs_taxdump = ground_expr
+    let needs_taxdump = all_expr
         .as_ref()
         .is_some_and(|expr| expr_needs_taxdump(expr))
+        || ground_expr
+            .as_ref()
+            .is_some_and(|expr| expr_needs_taxdump(expr))
         || pred_expr
             .as_ref()
             .is_some_and(|expr| expr_needs_taxdump(expr));
@@ -72,11 +83,17 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
         bail!("ground truth profile has no samples");
     }
 
+    if let Some(expr) = all_expr.as_ref() {
+        gt_samples = apply_filter(&gt_samples, expr, taxonomy.as_ref());
+    }
+
     if let Some(expr) = ground_expr.as_ref() {
         gt_samples = apply_filter(&gt_samples, expr, taxonomy.as_ref());
         if gt_samples.is_empty() {
-            bail!("ground truth profile has no samples after applying --gf");
+            bail!("ground truth profile has no samples after applying filters");
         }
+    } else if gt_samples.is_empty() {
+        bail!("ground truth profile has no samples after applying filters");
     }
 
     fs::create_dir_all(&cfg.output)
@@ -120,7 +137,7 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
             .with_context(|| format!("creating benchmark report {}", path.display()))?;
         writeln!(
             writer,
-            "profile\tsample\trank\ttp\tfp\tfn\tprecision\trecall\tf1\tjaccard\tl1_error\tbray_curtis\tshannon_pred\tshannon_truth\tevenness_pred\tevenness_truth\tpearson\tspearman\tweighted_unifrac\tunweighted_unifrac"
+            "profile\tsample\trank\ttp\tfp\tfn\tprecision\trecall\tf1\tjaccard\tl1_error\tbray_curtis\tshannon_pred\tshannon_truth\tevenness_pred\tevenness_truth\tpearson\tspearman\tweighted_unifrac\tunweighted_unifrac\tabundance_rank_error\tmass_weighted_abundance_rank_error"
         )?;
 
         let gt_map = build_profile_map(
@@ -135,6 +152,9 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
 
         for (pred_path, label) in cfg.predictions.iter().zip(labels.iter()) {
             let mut pred_samples = cami::parse_cami(pred_path)?;
+            if let Some(expr) = all_expr.as_ref() {
+                pred_samples = apply_filter(&pred_samples, expr, taxonomy.as_ref());
+            }
             if let Some(expr) = pred_expr.as_ref() {
                 pred_samples = apply_filter(&pred_samples, expr, taxonomy.as_ref());
             }
@@ -158,7 +178,7 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
                         .and_then(|map| map.get(&rank))
                         .map(|v| v.as_slice())
                         .unwrap_or(&[]);
-                    let metrics = compute_metrics(gt_entries, pred_entries);
+                    let metrics = compute_metrics(gt_entries, pred_entries)?;
                     write_metrics(&mut writer, label, sample_id, &rank, &metrics)?;
                 }
             }
@@ -275,20 +295,42 @@ struct Metrics {
     spearman: Option<f64>,
     weighted_unifrac: Option<f64>,
     unweighted_unifrac: Option<f64>,
+    abundance_rank_error: Option<f64>,
+    mass_weighted_abundance_rank_error: Option<f64>,
 }
 
-fn compute_metrics(gt_entries: &[ProfileEntry], pred_entries: &[ProfileEntry]) -> Metrics {
+fn compute_metrics(gt_entries: &[ProfileEntry], pred_entries: &[ProfileEntry]) -> Result<Metrics> {
     let mut metrics = Metrics::default();
-    let mut gt_map: HashMap<String, &ProfileEntry> = HashMap::new();
+    let mut gt_map: HashMap<String, f64> = HashMap::new();
     for entry in gt_entries {
+        ensure!(
+            !entry.percentage.is_nan(),
+            "ground truth abundance for taxid {} is NaN",
+            entry.taxid
+        );
+        ensure!(
+            entry.percentage >= 0.0,
+            "ground truth abundance for taxid {} is negative",
+            entry.taxid
+        );
         if entry.percentage > 0.0 {
-            gt_map.insert(entry.taxid.clone(), entry);
+            gt_map.insert(entry.taxid.clone(), entry.percentage);
         }
     }
-    let mut pred_map: HashMap<String, &ProfileEntry> = HashMap::new();
+    let mut pred_map: HashMap<String, f64> = HashMap::new();
     for entry in pred_entries {
+        ensure!(
+            !entry.percentage.is_nan(),
+            "predicted abundance for taxid {} is NaN",
+            entry.taxid
+        );
+        ensure!(
+            entry.percentage >= 0.0,
+            "predicted abundance for taxid {} is negative",
+            entry.taxid
+        );
         if entry.percentage > 0.0 {
-            pred_map.insert(entry.taxid.clone(), entry);
+            pred_map.insert(entry.taxid.clone(), entry.percentage);
         }
     }
 
@@ -310,8 +352,8 @@ fn compute_metrics(gt_entries: &[ProfileEntry], pred_entries: &[ProfileEntry]) -
     let mut sum_tot = 0.0;
 
     for taxid in &union {
-        let g = gt_map.get(taxid).map(|e| e.percentage).unwrap_or(0.0);
-        let p = pred_map.get(taxid).map(|e| e.percentage).unwrap_or(0.0);
+        let g = gt_map.get(taxid).copied().unwrap_or(0.0);
+        let p = pred_map.get(taxid).copied().unwrap_or(0.0);
         if g > 0.0 && p > 0.0 {
             metrics.tp += 1;
         } else if p > 0.0 {
@@ -360,8 +402,11 @@ fn compute_metrics(gt_entries: &[ProfileEntry], pred_entries: &[ProfileEntry]) -
     let (weighted, unweighted) = unifrac(gt_entries, pred_entries, gt_total, pred_total);
     metrics.weighted_unifrac = weighted;
     metrics.unweighted_unifrac = unweighted;
+    metrics.abundance_rank_error = Some(abundance_rank_error(&gt_map, &pred_map)?);
+    metrics.mass_weighted_abundance_rank_error =
+        Some(mass_weighted_abundance_rank_error(&gt_map, &pred_map, 1.0)?);
 
-    metrics
+    Ok(metrics)
 }
 
 fn ratio(num: f64, denom: f64) -> Option<f64> {
@@ -627,6 +672,208 @@ fn accumulate_flows(node: &TreeNode) -> (f64, f64, f64, f64, f64, f64) {
     )
 }
 
+fn abundance_rank_error(
+    gt_map: &HashMap<String, f64>,
+    pred_map: &HashMap<String, f64>,
+) -> Result<f64> {
+    let num_gt = gt_map.len();
+    let num_pred = pred_map.len();
+
+    if num_gt == 0 && num_pred == 0 {
+        return Ok(0.0);
+    }
+
+    let mut gt_sorted: Vec<(String, f64)> = gt_map
+        .iter()
+        .map(|(taxon, value)| (taxon.clone(), *value))
+        .collect();
+    gt_sorted.sort_by(
+        |a, b| match b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal) {
+            Ordering::Equal => a.0.cmp(&b.0),
+            other => other,
+        },
+    );
+
+    let mut pred_sorted: Vec<(String, f64)> = pred_map
+        .iter()
+        .map(|(taxon, value)| (taxon.clone(), *value))
+        .collect();
+    pred_sorted.sort_by(
+        |a, b| match b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal) {
+            Ordering::Equal => a.0.cmp(&b.0),
+            other => other,
+        },
+    );
+
+    let mut gt_ranks: HashMap<String, usize> = HashMap::new();
+    for (idx, (taxon, _)) in gt_sorted.iter().enumerate() {
+        gt_ranks.insert(taxon.clone(), idx + 1);
+    }
+
+    let mut pred_ranks: HashMap<String, usize> = HashMap::new();
+    for (idx, (taxon, _)) in pred_sorted.iter().enumerate() {
+        pred_ranks.insert(taxon.clone(), idx + 1);
+    }
+
+    let mut total_error = 0.0;
+
+    if num_gt > 0 {
+        let num_gt_f = num_gt as f64;
+        for (taxon, &gt_rank) in &gt_ranks {
+            if let Some(&pred_rank) = pred_ranks.get(taxon) {
+                let weight = (num_gt - gt_rank + 1) as f64 / num_gt_f;
+                let rank_diff = if gt_rank > pred_rank {
+                    (gt_rank - pred_rank) as f64
+                } else {
+                    (pred_rank - gt_rank) as f64
+                };
+                total_error += rank_diff * weight;
+            }
+        }
+
+        for (taxon, &gt_rank) in &gt_ranks {
+            if !pred_ranks.contains_key(taxon) {
+                let offset = (num_gt - gt_rank + 1) as f64;
+                let weight = offset / num_gt_f;
+                total_error += offset * weight;
+            }
+        }
+    }
+
+    if num_pred > 0 {
+        let num_pred_f = num_pred as f64;
+        for (taxon, &pred_rank) in &pred_ranks {
+            if !gt_ranks.contains_key(taxon) {
+                let offset = (num_pred - pred_rank + 1) as f64;
+                let weight = offset / num_pred_f;
+                total_error += offset * weight;
+            }
+        }
+    }
+
+    let mut normalization = 0.0;
+    if num_gt > 0 {
+        let num_gt_f = num_gt as f64;
+        for j in 1..=num_gt {
+            let term = (num_gt + 1 - j) as f64;
+            normalization += (term * term) / num_gt_f;
+        }
+    }
+    if num_pred > 0 {
+        let num_pred_f = num_pred as f64;
+        for k in 1..=num_pred {
+            let term = (num_pred + 1 - k) as f64;
+            normalization += (term * term) / num_pred_f;
+        }
+    }
+
+    if normalization <= 0.0 {
+        return Ok(0.0);
+    }
+
+    let ratio = total_error / normalization;
+    if ratio < 0.0 {
+        Ok(0.0)
+    } else if ratio > 1.0 {
+        Ok(1.0)
+    } else {
+        Ok(ratio)
+    }
+}
+
+fn mass_weighted_abundance_rank_error(
+    gt_map: &HashMap<String, f64>,
+    pred_map: &HashMap<String, f64>,
+    p: f64,
+) -> Result<f64> {
+    ensure!(p > 0.0, "mARE exponent must be positive");
+
+    let (gt_weights, gt_ranks, gt_count, gt_mass) = prepare_profile(gt_map);
+    let (pred_weights, pred_ranks, pred_count, pred_mass) = prepare_profile(pred_map);
+
+    let denominator = gt_mass + pred_mass;
+    if denominator <= 0.0 {
+        return Ok(0.0);
+    }
+
+    let mut union: BTreeSet<String> = BTreeSet::new();
+    for taxon in gt_weights.keys() {
+        union.insert(taxon.clone());
+    }
+    for taxon in pred_weights.keys() {
+        union.insert(taxon.clone());
+    }
+
+    if union.is_empty() {
+        return Ok(0.0);
+    }
+
+    let max_rank_diff = (gt_count.max(pred_count).saturating_sub(1)) as f64;
+
+    let mut numerator = 0.0;
+    for taxon in union {
+        match (gt_weights.get(&taxon), pred_weights.get(&taxon)) {
+            (Some(&p_gt), Some(&p_pred)) => {
+                let rank_penalty = if max_rank_diff > 0.0 {
+                    let gt_rank = gt_ranks.get(&taxon).copied().unwrap_or(1);
+                    let pred_rank = pred_ranks.get(&taxon).copied().unwrap_or(1);
+                    let diff = (gt_rank as i64 - pred_rank as i64).abs() as f64;
+                    (diff / max_rank_diff).powf(p)
+                } else {
+                    0.0
+                };
+                numerator += rank_penalty * (p_gt + p_pred);
+            }
+            (Some(&p_gt), None) => {
+                numerator += p_gt;
+            }
+            (None, Some(&p_pred)) => {
+                numerator += p_pred;
+            }
+            (None, None) => {}
+        }
+    }
+
+    let ratio = numerator / denominator;
+    Ok(ratio.max(0.0).min(1.0))
+}
+
+fn prepare_profile(
+    abundances: &HashMap<String, f64>,
+) -> (HashMap<String, f64>, HashMap<String, usize>, usize, f64) {
+    let mut entries: Vec<(String, f64)> = abundances
+        .iter()
+        .map(|(taxon, value)| (taxon.clone(), *value))
+        .collect();
+
+    let total: f64 = entries.iter().map(|(_, v)| *v).sum();
+    if !total.is_finite() || total <= 0.0 {
+        return (HashMap::new(), HashMap::new(), 0, 0.0);
+    }
+
+    for (_, value) in entries.iter_mut() {
+        *value /= total;
+    }
+
+    entries.sort_by(
+        |a, b| match b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal) {
+            Ordering::Equal => a.0.cmp(&b.0),
+            other => other,
+        },
+    );
+
+    let mut ranks = HashMap::new();
+    let mut weights = HashMap::new();
+    for (idx, (taxon, value)) in entries.into_iter().enumerate() {
+        ranks.insert(taxon.clone(), idx + 1);
+        weights.insert(taxon, value);
+    }
+
+    let sum_norm = weights.values().copied().sum();
+    let count = ranks.len();
+    (weights, ranks, count, sum_norm)
+}
+
 fn write_metrics<W: Write>(
     writer: &mut W,
     label: &str,
@@ -636,7 +883,7 @@ fn write_metrics<W: Write>(
 ) -> Result<()> {
     writeln!(
         writer,
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         label,
         sample,
         rank,
@@ -656,7 +903,9 @@ fn write_metrics<W: Write>(
         format_opt(metrics.pearson),
         format_opt(metrics.spearman),
         format_opt(metrics.weighted_unifrac),
-        format_opt(metrics.unweighted_unifrac)
+        format_opt(metrics.unweighted_unifrac),
+        format_opt(metrics.abundance_rank_error),
+        format_opt(metrics.mass_weighted_abundance_rank_error)
     )?;
     Ok(())
 }
@@ -675,4 +924,97 @@ fn taxonomy_dir() -> PathBuf {
     dirs::home_dir()
         .map(|p| p.join(".cami"))
         .unwrap_or_else(|| PathBuf::from(".cami"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{abundance_rank_error, mass_weighted_abundance_rank_error};
+    use std::collections::HashMap;
+
+    fn map(entries: &[(&str, f64)]) -> HashMap<String, f64> {
+        entries
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), *value))
+            .collect()
+    }
+
+    #[test]
+    fn mass_weighted_abundance_rank_error_perfect_match() {
+        let gt = map(&[("A", 0.5), ("B", 0.3), ("C", 0.2)]);
+        let pred = map(&[("A", 0.5), ("B", 0.3), ("C", 0.2)]);
+        let score = mass_weighted_abundance_rank_error(&gt, &pred, 1.0).unwrap();
+        assert!((score - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mass_weighted_abundance_rank_error_only_missed_taxa() {
+        let gt = map(&[("A", 0.6), ("B", 0.4)]);
+        let pred = map(&[]);
+        let score = mass_weighted_abundance_rank_error(&gt, &pred, 1.0).unwrap();
+        assert!((score - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mass_weighted_abundance_rank_error_only_false_positives() {
+        let gt = map(&[]);
+        let pred = map(&[("X", 0.7), ("Y", 0.3)]);
+        let score = mass_weighted_abundance_rank_error(&gt, &pred, 1.0).unwrap();
+        assert!((score - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mass_weighted_abundance_rank_error_mixed_case() {
+        let gt = map(&[("A", 0.6), ("B", 0.3), ("C", 0.1)]);
+        let pred = map(&[("A", 0.55), ("C", 0.35), ("D", 0.10)]);
+        let score = mass_weighted_abundance_rank_error(&gt, &pred, 1.0).unwrap();
+        assert!((score - 0.3125).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mass_weighted_abundance_rank_error_rank_reversal() {
+        let gt = map(&[("A", 0.5), ("B", 0.3), ("C", 0.2)]);
+        let pred = map(&[("A", 0.2), ("B", 0.3), ("C", 0.5)]);
+        let score = mass_weighted_abundance_rank_error(&gt, &pred, 1.0).unwrap();
+        assert!((score - 0.7).abs() < 1e-9);
+    }
+
+    #[test]
+    fn abundance_rank_error_perfect_match() {
+        let gt = map(&[("A", 0.5), ("B", 0.3), ("C", 0.2)]);
+        let pred = map(&[("A", 0.5), ("B", 0.3), ("C", 0.2)]);
+        let score = abundance_rank_error(&gt, &pred).unwrap();
+        assert!((score - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn abundance_rank_error_rank_swap() {
+        let gt = map(&[("A", 0.5), ("B", 0.3), ("C", 0.2)]);
+        let pred = map(&[("B", 0.5), ("A", 0.3), ("C", 0.2)]);
+        let score = abundance_rank_error(&gt, &pred).unwrap();
+        assert!(score > 0.0 && score < 1.0);
+    }
+
+    #[test]
+    fn abundance_rank_error_only_missed_taxa() {
+        let gt = map(&[("A", 0.6), ("B", 0.4)]);
+        let pred = map(&[]);
+        let score = abundance_rank_error(&gt, &pred).unwrap();
+        assert!((score - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn abundance_rank_error_only_false_positives() {
+        let gt = map(&[]);
+        let pred = map(&[("X", 0.7), ("Y", 0.3)]);
+        let score = abundance_rank_error(&gt, &pred).unwrap();
+        assert!((score - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn abundance_rank_error_mixed_case() {
+        let gt = map(&[("A", 0.6), ("B", 0.3), ("C", 0.1)]);
+        let pred = map(&[("A", 0.55), ("C", 0.35), ("D", 0.10)]);
+        let score = abundance_rank_error(&gt, &pred).unwrap();
+        assert!(score > 0.0 && score < 1.0);
+    }
 }
