@@ -137,7 +137,7 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
             .with_context(|| format!("creating benchmark report {}", path.display()))?;
         writeln!(
             writer,
-            "profile\tsample\trank\ttp\tfp\tfn\tprecision\trecall\tf1\tjaccard\tl1_error\tbray_curtis\tshannon_pred\tshannon_truth\tevenness_pred\tevenness_truth\tpearson\tspearman\tweighted_unifrac\tunweighted_unifrac\tabundance_rank_error"
+            "profile\tsample\trank\ttp\tfp\tfn\tprecision\trecall\tf1\tjaccard\tl1_error\tbray_curtis\tshannon_pred\tshannon_truth\tevenness_pred\tevenness_truth\tpearson\tspearman\tweighted_unifrac\tunweighted_unifrac\tabundance_rank_error\tmass_weighted_abundance_rank_error"
         )?;
 
         let gt_map = build_profile_map(
@@ -296,6 +296,7 @@ struct Metrics {
     weighted_unifrac: Option<f64>,
     unweighted_unifrac: Option<f64>,
     abundance_rank_error: Option<f64>,
+    mass_weighted_abundance_rank_error: Option<f64>,
 }
 
 fn compute_metrics(gt_entries: &[ProfileEntry], pred_entries: &[ProfileEntry]) -> Result<Metrics> {
@@ -402,6 +403,8 @@ fn compute_metrics(gt_entries: &[ProfileEntry], pred_entries: &[ProfileEntry]) -
     metrics.weighted_unifrac = weighted;
     metrics.unweighted_unifrac = unweighted;
     metrics.abundance_rank_error = Some(abundance_rank_error(&gt_map, &pred_map)?);
+    metrics.mass_weighted_abundance_rank_error =
+        Some(mass_weighted_abundance_rank_error(&gt_map, &pred_map, 1.0)?);
 
     Ok(metrics)
 }
@@ -778,6 +781,99 @@ fn abundance_rank_error(
     }
 }
 
+fn mass_weighted_abundance_rank_error(
+    gt_map: &HashMap<String, f64>,
+    pred_map: &HashMap<String, f64>,
+    p: f64,
+) -> Result<f64> {
+    ensure!(p > 0.0, "mARE exponent must be positive");
+
+    let (gt_weights, gt_ranks, gt_count, gt_mass) = prepare_profile(gt_map);
+    let (pred_weights, pred_ranks, pred_count, pred_mass) = prepare_profile(pred_map);
+
+    let denominator = gt_mass + pred_mass;
+    if denominator <= 0.0 {
+        return Ok(0.0);
+    }
+
+    let mut union: BTreeSet<String> = BTreeSet::new();
+    for taxon in gt_weights.keys() {
+        union.insert(taxon.clone());
+    }
+    for taxon in pred_weights.keys() {
+        union.insert(taxon.clone());
+    }
+
+    if union.is_empty() {
+        return Ok(0.0);
+    }
+
+    let max_rank_diff = (gt_count.max(pred_count).saturating_sub(1)) as f64;
+
+    let mut numerator = 0.0;
+    for taxon in union {
+        match (gt_weights.get(&taxon), pred_weights.get(&taxon)) {
+            (Some(&p_gt), Some(&p_pred)) => {
+                let rank_penalty = if max_rank_diff > 0.0 {
+                    let gt_rank = gt_ranks.get(&taxon).copied().unwrap_or(1);
+                    let pred_rank = pred_ranks.get(&taxon).copied().unwrap_or(1);
+                    let diff = (gt_rank as i64 - pred_rank as i64).abs() as f64;
+                    (diff / max_rank_diff).powf(p)
+                } else {
+                    0.0
+                };
+                numerator += rank_penalty * (p_gt + p_pred);
+            }
+            (Some(&p_gt), None) => {
+                numerator += p_gt;
+            }
+            (None, Some(&p_pred)) => {
+                numerator += p_pred;
+            }
+            (None, None) => {}
+        }
+    }
+
+    let ratio = numerator / denominator;
+    Ok(ratio.max(0.0).min(1.0))
+}
+
+fn prepare_profile(
+    abundances: &HashMap<String, f64>,
+) -> (HashMap<String, f64>, HashMap<String, usize>, usize, f64) {
+    let mut entries: Vec<(String, f64)> = abundances
+        .iter()
+        .map(|(taxon, value)| (taxon.clone(), *value))
+        .collect();
+
+    let total: f64 = entries.iter().map(|(_, v)| *v).sum();
+    if !total.is_finite() || total <= 0.0 {
+        return (HashMap::new(), HashMap::new(), 0, 0.0);
+    }
+
+    for (_, value) in entries.iter_mut() {
+        *value /= total;
+    }
+
+    entries.sort_by(
+        |a, b| match b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal) {
+            Ordering::Equal => a.0.cmp(&b.0),
+            other => other,
+        },
+    );
+
+    let mut ranks = HashMap::new();
+    let mut weights = HashMap::new();
+    for (idx, (taxon, value)) in entries.into_iter().enumerate() {
+        ranks.insert(taxon.clone(), idx + 1);
+        weights.insert(taxon, value);
+    }
+
+    let sum_norm = weights.values().copied().sum();
+    let count = ranks.len();
+    (weights, ranks, count, sum_norm)
+}
+
 fn write_metrics<W: Write>(
     writer: &mut W,
     label: &str,
@@ -787,7 +883,7 @@ fn write_metrics<W: Write>(
 ) -> Result<()> {
     writeln!(
         writer,
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         label,
         sample,
         rank,
@@ -808,7 +904,8 @@ fn write_metrics<W: Write>(
         format_opt(metrics.spearman),
         format_opt(metrics.weighted_unifrac),
         format_opt(metrics.unweighted_unifrac),
-        format_opt(metrics.abundance_rank_error)
+        format_opt(metrics.abundance_rank_error),
+        format_opt(metrics.mass_weighted_abundance_rank_error)
     )?;
     Ok(())
 }
@@ -831,7 +928,7 @@ fn taxonomy_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::abundance_rank_error;
+    use super::{abundance_rank_error, mass_weighted_abundance_rank_error};
     use std::collections::HashMap;
 
     fn map(entries: &[(&str, f64)]) -> HashMap<String, f64> {
@@ -839,6 +936,46 @@ mod tests {
             .iter()
             .map(|(name, value)| ((*name).to_string(), *value))
             .collect()
+    }
+
+    #[test]
+    fn mass_weighted_abundance_rank_error_perfect_match() {
+        let gt = map(&[("A", 0.5), ("B", 0.3), ("C", 0.2)]);
+        let pred = map(&[("A", 0.5), ("B", 0.3), ("C", 0.2)]);
+        let score = mass_weighted_abundance_rank_error(&gt, &pred, 1.0).unwrap();
+        assert!((score - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mass_weighted_abundance_rank_error_only_missed_taxa() {
+        let gt = map(&[("A", 0.6), ("B", 0.4)]);
+        let pred = map(&[]);
+        let score = mass_weighted_abundance_rank_error(&gt, &pred, 1.0).unwrap();
+        assert!((score - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mass_weighted_abundance_rank_error_only_false_positives() {
+        let gt = map(&[]);
+        let pred = map(&[("X", 0.7), ("Y", 0.3)]);
+        let score = mass_weighted_abundance_rank_error(&gt, &pred, 1.0).unwrap();
+        assert!((score - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mass_weighted_abundance_rank_error_mixed_case() {
+        let gt = map(&[("A", 0.6), ("B", 0.3), ("C", 0.1)]);
+        let pred = map(&[("A", 0.55), ("C", 0.35), ("D", 0.10)]);
+        let score = mass_weighted_abundance_rank_error(&gt, &pred, 1.0).unwrap();
+        assert!((score - 0.3125).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mass_weighted_abundance_rank_error_rank_reversal() {
+        let gt = map(&[("A", 0.5), ("B", 0.3), ("C", 0.2)]);
+        let pred = map(&[("A", 0.2), ("B", 0.3), ("C", 0.5)]);
+        let score = mass_weighted_abundance_rank_error(&gt, &pred, 1.0).unwrap();
+        assert!((score - 0.7).abs() < 1e-9);
     }
 
     #[test]

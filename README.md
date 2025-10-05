@@ -10,7 +10,7 @@
 - Fill in missing higher ranks by pulling lineage information from the NCBI taxdump and round abundances to five decimal places.
 - Renormalize abundances so that every rank in every sample sums to 100.
 - Reorder taxa within each rank, either by abundance (dropping zeroes) or by lineage, to make tables easier to scan.
-- Benchmark predicted profiles against ground truth tables with precision/recall, abundance error, correlation, diversity, UniFrac, and abundance-rank metrics.
+- Benchmark predicted profiles against ground truth tables with precision/recall, abundance error, correlation, diversity, UniFrac, and abundance-rank metrics (ARE and mARE).
 
 The repository includes a small demo table at [`examples/test.cami`](examples/test.cami) that you can use with the examples below.
 
@@ -131,7 +131,7 @@ cami sort --taxpathsn examples/test.cami > lineage_sorted.cami
 
 ### `cami benchmark`
 
-Evaluate one or more predicted profiles against a ground-truth CAMI table. For every sample and rank the command computes detection metrics (TP/FP/FN, precision/purity, recall/completeness, F1, Jaccard), abundance distances (L1 error, Bray–Curtis), diversity summaries (Shannon index and equitability), Pearson/Spearman correlations, weighted/unweighted UniFrac differences, and the Abundance Rank Error (ARE). Results are written to TSV files so you can load them into spreadsheets or plotting notebooks.
+Evaluate one or more predicted profiles against a ground-truth CAMI table. For every sample and rank the command computes detection metrics (TP/FP/FN, precision/purity, recall/completeness, F1, Jaccard), abundance distances (L1 error, Bray–Curtis), diversity summaries (Shannon index and equitability), Pearson/Spearman correlations, weighted/unweighted UniFrac differences, the Abundance Rank Error (ARE), and the mass-weighted Abundance Rank Error (mARE). Results are written to TSV files so you can load them into spreadsheets or plotting notebooks.
 
 ```bash
 cami benchmark -g truth.cami predictions/profiler1.cami predictions/profiler2.cami \
@@ -153,8 +153,8 @@ cami benchmark -g truth.cami predictions/profiler1.cami predictions/profiler2.ca
 Each TSV contains one row per profile/sample/rank combination:
 
 ```text
-profile   sample   rank     tp  fp  fn  precision  recall   f1        jaccard  l1_error  bray_curtis  shannon_pred  shannon_truth  evenness_pred  evenness_truth  pearson  spearman  weighted_unifrac  unweighted_unifrac  abundance_rank_error
-profiler1 s1       species  42  5   3   0.893617   0.933333  0.913043  0.777778 4.210000  0.021053     2.271111      2.318765       0.932842       0.950112        0.981000 0.975000 0.042000           0.018519              0.052632
+profile   sample   rank     tp  fp  fn  precision  recall   f1        jaccard  l1_error  bray_curtis  shannon_pred  shannon_truth  evenness_pred  evenness_truth  pearson  spearman  weighted_unifrac  unweighted_unifrac  abundance_rank_error  mass_weighted_abundance_rank_error
+profiler1 s1       species  42  5   3   0.893617   0.933333  0.913043  0.777778 4.210000  0.021053     2.271111      2.318765       0.932842       0.950112        0.981000 0.975000 0.042000           0.018519              0.052632              0.041875
 ```
 
 ## Working with the filter language

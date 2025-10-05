@@ -51,7 +51,7 @@ fn split_ranks(input: &str) -> Vec<String> {
 enum Commands {
     #[command(
         about = "Benchmark predicted profiles against a ground truth",
-        long_about = "Compare predicted CAMI abundance tables to a ground truth profile per sample and rank. Reports TP/FP/FN counts, precision (purity), recall (completeness), F1-score, Jaccard index, L1 error, Bray-Curtis distance, Shannon diversity, equitability, Pearson and Spearman correlations, weighted and unweighted UniFrac differences, and the Abundance Rank Error (ARE)."
+        long_about = "Compare predicted CAMI abundance tables to a ground truth profile per sample and rank. Reports TP/FP/FN counts, precision (purity), recall (completeness), F1-score, Jaccard index, L1 error, Bray-Curtis distance, Shannon diversity, equitability, Pearson and Spearman correlations, weighted and unweighted UniFrac differences, the Abundance Rank Error (ARE), and the mass-weighted Abundance Rank Error (mARE)."
     )]
     Benchmark {
         #[arg(
