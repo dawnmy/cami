@@ -229,9 +229,9 @@ fn build_rank_map(
     let tid = parse_taxid(taxid)?;
     let lineage = taxonomy.lineage(tid);
     let mut map = HashMap::new();
-    for (tid_u32, rank, name) in lineage {
-        if sample.ranks.iter().any(|r| r == &rank) {
-            map.insert(rank, (tid_u32.to_string(), name));
+    for (tid_u32, rank, name) in lineage.iter() {
+        if sample.ranks.iter().any(|r| r == rank) {
+            map.insert(rank.clone(), (tid_u32.to_string(), name.clone()));
         }
     }
     if map.is_empty() { None } else { Some(map) }
