@@ -6,6 +6,7 @@ mod taxonomy;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
+use std::io;
 use std::path::PathBuf;
 
 use commands::{
@@ -272,7 +273,7 @@ enum Commands {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    match &cli.command {
+    let result = match &cli.command {
         Commands::Benchmark {
             ground_truth,
             predictions,
@@ -375,5 +376,19 @@ fn main() -> Result<()> {
             };
             sort_cmd::run(&cfg)
         }
+    };
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) if is_broken_pipe(&err) => Ok(()),
+        Err(err) => Err(err),
     }
+}
+
+fn is_broken_pipe(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| match cause.downcast_ref::<io::Error>() {
+            Some(io_err) => io_err.kind() == io::ErrorKind::BrokenPipe,
+            None => false,
+        })
 }
