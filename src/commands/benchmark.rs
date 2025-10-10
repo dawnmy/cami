@@ -278,8 +278,8 @@ fn entry_belongs_to_domain(entry: &Entry, domain: &str, taxonomy: Option<&Taxono
         let trimmed = name.trim();
         !trimmed.is_empty() && trimmed.eq_ignore_ascii_case(domain)
     }) || taxonomy
-        .and_then(|tax| highest_taxid_in_taxpath(entry).and_then(|tid| tax.superkingdom_of(tid)))
-        .map(|sk| sk.eq_ignore_ascii_case(domain))
+        .and_then(|tax| highest_taxid_in_taxpath(entry).and_then(|tid| tax.domain_of(tid)))
+        .map(|name| name.eq_ignore_ascii_case(domain))
         .unwrap_or(false)
 }
 
@@ -535,19 +535,19 @@ fn unifrac(
         return (None, None);
     }
 
-    let mut root = TreeNode::default();
+    let mut branches: HashMap<String, BranchStats> = HashMap::new();
 
-    let mut gt_mass_sum = 0.0;
-    let mut pred_mass_sum = 0.0;
     for entry in &gt_positive {
         let mass = if gt_total > 0.0 {
             entry.percentage / gt_total
         } else {
             0.0
         };
-        gt_mass_sum += mass;
+        if mass <= 0.0 {
+            continue;
+        }
         let parts = split_taxpath(&entry.taxpath);
-        add_mass(&mut root, &parts, 0, mass, true, true);
+        add_branch_masses(&mut branches, &parts, mass, true);
     }
 
     for entry in &pred_positive {
@@ -556,61 +556,55 @@ fn unifrac(
         } else {
             0.0
         };
-        pred_mass_sum += mass;
+        if mass <= 0.0 {
+            continue;
+        }
         let parts = split_taxpath(&entry.taxpath);
-        add_mass(&mut root, &parts, 0, mass, true, false);
+        add_branch_masses(&mut branches, &parts, mass, false);
     }
 
-    if gt_total > 0.0 {
-        let remaining = (1.0 - gt_mass_sum).max(0.0);
-        if remaining > 1e-12 {
-            add_mass(&mut root, &[], 0, remaining, false, true);
+    let mut weighted_numerator = 0.0;
+    let mut weighted_denominator = 0.0;
+    let mut unweighted_numerator = 0.0;
+    let mut unweighted_denominator = 0.0;
+
+    for stats in branches.values() {
+        let diff = (stats.gt_mass - stats.pred_mass).abs();
+        let sum = stats.gt_mass + stats.pred_mass;
+        weighted_numerator += diff;
+        weighted_denominator += sum;
+
+        if stats.gt_present || stats.pred_present {
+            unweighted_denominator += 1.0;
+            if stats.gt_present ^ stats.pred_present {
+                unweighted_numerator += 1.0;
+            }
         }
-    } else if gt_positive.is_empty() && pred_mass_sum > 0.0 {
-        add_mass(&mut root, &[], 0, 1.0, false, true);
     }
-
-    if pred_total > 0.0 {
-        let remaining = (1.0 - pred_mass_sum).max(0.0);
-        if remaining > 1e-12 {
-            add_mass(&mut root, &[], 0, remaining, false, false);
-        }
-    } else if pred_positive.is_empty() && gt_mass_sum > 0.0 {
-        // When the prediction lacks taxa at this rank, place the full mass at the root so
-        // the earth-mover interpretation remains valid.
-        add_mass(&mut root, &[], 0, 1.0, false, false);
-    }
-
-    let (
-        gt_mass,
-        pred_mass,
-        gt_present,
-        pred_present,
-        weighted_numerator,
-        weighted_denominator,
-        unweighted_numerator,
-        unweighted_denominator,
-    ) = accumulate_flows(&root);
 
     let weighted = if weighted_denominator > 0.0 {
-        Some(
-            (weighted_numerator / weighted_denominator)
-                .max(0.0)
-                .min(1.0),
-        )
-    } else if gt_mass > 0.0 || pred_mass > 0.0 {
+        let mut ratio = weighted_numerator / weighted_denominator;
+        if ratio < 0.0 {
+            ratio = 0.0;
+        } else if ratio > 1.0 {
+            ratio = 1.0;
+        }
+        Some(ratio)
+    } else if !gt_positive.is_empty() || !pred_positive.is_empty() {
         Some(0.0)
     } else {
         None
     };
 
     let unweighted = if unweighted_denominator > 0.0 {
-        Some(
-            (unweighted_numerator / unweighted_denominator)
-                .max(0.0)
-                .min(1.0),
-        )
-    } else if gt_present || pred_present {
+        let mut ratio = unweighted_numerator / unweighted_denominator;
+        if ratio < 0.0 {
+            ratio = 0.0;
+        } else if ratio > 1.0 {
+            ratio = 1.0;
+        }
+        Some(ratio)
+    } else if !gt_positive.is_empty() || !pred_positive.is_empty() {
         Some(0.0)
     } else {
         None
@@ -620,8 +614,7 @@ fn unifrac(
 }
 
 #[derive(Default)]
-struct TreeNode {
-    children: HashMap<String, TreeNode>,
+struct BranchStats {
     gt_mass: f64,
     pred_mass: f64,
     gt_present: bool,
@@ -636,86 +629,31 @@ fn split_taxpath(path: &str) -> Vec<String> {
         .collect()
 }
 
-fn add_mass(
-    node: &mut TreeNode,
+fn add_branch_masses(
+    branches: &mut HashMap<String, BranchStats>,
     parts: &[String],
-    idx: usize,
     mass: f64,
-    present: bool,
     is_gt: bool,
 ) {
-    if idx >= parts.len() {
-        if is_gt {
-            node.gt_mass += mass;
-            node.gt_present |= present;
-        } else {
-            node.pred_mass += mass;
-            node.pred_present |= present;
-        }
+    if parts.is_empty() || mass <= 0.0 {
         return;
     }
 
-    let child = node
-        .children
-        .entry(parts[idx].clone())
-        .or_insert_with(TreeNode::default);
-    add_mass(child, parts, idx + 1, mass, present, is_gt);
-}
-
-fn accumulate_flows(node: &TreeNode) -> (f64, f64, bool, bool, f64, f64, f64, f64) {
-    let mut gt_mass = node.gt_mass;
-    let mut pred_mass = node.pred_mass;
-    let mut gt_present = node.gt_present;
-    let mut pred_present = node.pred_present;
-    let mut weighted_cost = 0.0;
-    let mut unweighted_cost = 0.0;
-    let mut weighted_total = 0.0;
-    let mut unweighted_total = 0.0;
-
-    for child in node.children.values() {
-        let (
-            child_gt_mass,
-            child_pred_mass,
-            child_gt_present,
-            child_pred_present,
-            child_weighted_cost,
-            child_weighted_total,
-            child_unweighted_cost,
-            child_unweighted_total,
-        ) = accumulate_flows(child);
-        weighted_cost += child_weighted_cost + (child_gt_mass - child_pred_mass).abs();
-        weighted_total += child_weighted_total + child_gt_mass + child_pred_mass;
-        // Unweighted UniFrac treats each branch as present (1) or absent (0) in a community,
-        // so the numerator counts branches exclusive to one community while the denominator
-        // counts branches present in either community exactly once.
-        let child_unique = if child_gt_present ^ child_pred_present {
-            1.0
+    let mut key = String::new();
+    for (idx, part) in parts.iter().enumerate() {
+        if idx > 0 {
+            key.push('|');
+        }
+        key.push_str(part);
+        let stats = branches.entry(key.clone()).or_default();
+        if is_gt {
+            stats.gt_mass += mass;
+            stats.gt_present = true;
         } else {
-            0.0
-        };
-        let child_union = if child_gt_present || child_pred_present {
-            1.0
-        } else {
-            0.0
-        };
-        unweighted_cost += child_unweighted_cost + child_unique;
-        unweighted_total += child_unweighted_total + child_union;
-        gt_mass += child_gt_mass;
-        pred_mass += child_pred_mass;
-        gt_present = gt_present || child_gt_present;
-        pred_present = pred_present || child_pred_present;
+            stats.pred_mass += mass;
+            stats.pred_present = true;
+        }
     }
-
-    (
-        gt_mass,
-        pred_mass,
-        gt_present,
-        pred_present,
-        weighted_cost,
-        weighted_total,
-        unweighted_cost,
-        unweighted_total,
-    )
 }
 
 fn abundance_rank_error(

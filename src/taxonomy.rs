@@ -135,6 +135,18 @@ impl Taxonomy {
             .insert(taxid, result.clone());
         result
     }
+
+    pub fn name_of(&self, taxid: u32) -> Option<String> {
+        self.names.get(&taxid).cloned()
+    }
+
+    pub fn domain_of(&self, taxid: u32) -> Option<String> {
+        if let Some(superkingdom) = self.superkingdom_of(taxid) {
+            return Some(superkingdom);
+        }
+
+        self.name_of(taxid)
+    }
 }
 
 pub fn ensure_taxdump(dir: &Path) -> Result<()> {
