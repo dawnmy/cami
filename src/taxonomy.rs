@@ -23,7 +23,7 @@ pub struct Taxonomy {
     names: HashMap<u32, String>,
     ancestors: RwLock<HashMap<u32, Arc<[u32]>>>,
     lineages: RwLock<HashMap<u32, Arc<[LineageEntry]>>>,
-    superkingdoms: RwLock<HashMap<u32, Option<String>>>,
+    domains: RwLock<HashMap<u32, Option<String>>>,
 }
 
 impl Taxonomy {
@@ -52,7 +52,7 @@ impl Taxonomy {
             names,
             ancestors: RwLock::new(HashMap::new()),
             lineages: RwLock::new(HashMap::new()),
-            superkingdoms: RwLock::new(HashMap::new()),
+            domains: RwLock::new(HashMap::new()),
         })
     }
 
@@ -118,34 +118,33 @@ impl Taxonomy {
         cached
     }
 
-    pub fn superkingdom_of(&self, taxid: u32) -> Option<String> {
-        if let Some(cached) = self.superkingdoms.read().unwrap().get(&taxid) {
-            return cached.clone();
-        }
-
-        let lineage = self.lineage(taxid);
-        let result = lineage
-            .iter()
-            .find(|(_, rank, _)| rank == "superkingdom")
-            .map(|(_, _, name)| name.clone());
-
-        self.superkingdoms
-            .write()
-            .unwrap()
-            .insert(taxid, result.clone());
-        result
-    }
-
     pub fn name_of(&self, taxid: u32) -> Option<String> {
         self.names.get(&taxid).cloned()
     }
 
     pub fn domain_of(&self, taxid: u32) -> Option<String> {
-        if let Some(superkingdom) = self.superkingdom_of(taxid) {
-            return Some(superkingdom);
+        if let Some(cached) = self.domains.read().unwrap().get(&taxid) {
+            return cached.clone();
         }
 
-        self.name_of(taxid)
+        let lineage = self.lineage(taxid);
+        let result = lineage.iter().find_map(|(_, rank, name)| {
+            if rank.eq_ignore_ascii_case("superkingdom")
+                || rank.eq_ignore_ascii_case("domain")
+                || rank.eq_ignore_ascii_case("acellular root")
+            {
+                Some(name.clone())
+            } else {
+                None
+            }
+        });
+
+        let final_result = result.or_else(|| self.name_of(taxid));
+        self.domains
+            .write()
+            .unwrap()
+            .insert(taxid, final_result.clone());
+        final_result
     }
 }
 
@@ -226,8 +225,43 @@ pub fn parse_taxid(taxid: &str) -> Option<u32> {
 }
 
 fn canonicalize_rank(rank: &str) -> String {
-    match rank {
-        "domain" => "superkingdom".to_string(),
-        other => other.to_string(),
+    rank.trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn domain_of_includes_acellular_root() {
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            1,
+            TaxNode {
+                parent: 1,
+                rank: "no rank".to_string(),
+            },
+        );
+        nodes.insert(
+            10239,
+            TaxNode {
+                parent: 1,
+                rank: "acellular root".to_string(),
+            },
+        );
+
+        let mut names = HashMap::new();
+        names.insert(1, "root".to_string());
+        names.insert(10239, "Viruses".to_string());
+
+        let taxonomy = Taxonomy {
+            nodes,
+            names,
+            ancestors: RwLock::new(HashMap::new()),
+            lineages: RwLock::new(HashMap::new()),
+            domains: RwLock::new(HashMap::new()),
+        };
+
+        assert_eq!(taxonomy.domain_of(10239), Some("Viruses".to_string()));
     }
 }
