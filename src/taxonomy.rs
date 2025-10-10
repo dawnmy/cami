@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::thread;
 use tar::Archive;
 
@@ -15,12 +15,15 @@ pub struct TaxNode {
     pub rank: String,
 }
 
+type LineageEntry = (u32, String, String);
+
 #[derive(Debug)]
 pub struct Taxonomy {
     nodes: HashMap<u32, TaxNode>,
     names: HashMap<u32, String>,
-    ancestors: RwLock<HashMap<u32, Vec<u32>>>,
-    lineages: RwLock<HashMap<u32, Vec<(u32, String, String)>>>,
+    ancestors: RwLock<HashMap<u32, Arc<[u32]>>>,
+    lineages: RwLock<HashMap<u32, Arc<[LineageEntry]>>>,
+    superkingdoms: RwLock<HashMap<u32, Option<String>>>,
 }
 
 impl Taxonomy {
@@ -49,10 +52,11 @@ impl Taxonomy {
             names,
             ancestors: RwLock::new(HashMap::new()),
             lineages: RwLock::new(HashMap::new()),
+            superkingdoms: RwLock::new(HashMap::new()),
         })
     }
 
-    pub fn ancestors_of(&self, taxid: u32) -> Vec<u32> {
+    pub fn ancestors_of(&self, taxid: u32) -> Arc<[u32]> {
         if let Some(cached) = self.ancestors.read().unwrap().get(&taxid) {
             return cached.clone();
         }
@@ -69,14 +73,15 @@ impl Taxonomy {
             current = node.parent;
         }
 
+        let cached: Arc<[u32]> = lineage.into_boxed_slice().into();
         self.ancestors
             .write()
             .unwrap()
-            .insert(taxid, lineage.clone());
-        lineage
+            .insert(taxid, cached.clone());
+        cached
     }
 
-    pub fn lineage(&self, taxid: u32) -> Vec<(u32, String, String)> {
+    pub fn lineage(&self, taxid: u32) -> Arc<[LineageEntry]> {
         if let Some(cached) = self.lineages.read().unwrap().get(&taxid) {
             return cached.clone();
         }
@@ -88,12 +93,11 @@ impl Taxonomy {
                 break;
             }
             visited.insert(tid);
-            let rank_raw = self
+            let rank = self
                 .nodes
                 .get(&tid)
                 .map(|n| n.rank.clone())
                 .unwrap_or_else(|| "no_rank".to_string());
-            let rank = canonicalize_rank(&rank_raw);
             let name = self
                 .names
                 .get(&tid)
@@ -109,8 +113,27 @@ impl Taxonomy {
             });
         }
         stack.reverse();
-        self.lineages.write().unwrap().insert(taxid, stack.clone());
-        stack
+        let cached: Arc<[LineageEntry]> = stack.into_boxed_slice().into();
+        self.lineages.write().unwrap().insert(taxid, cached.clone());
+        cached
+    }
+
+    pub fn superkingdom_of(&self, taxid: u32) -> Option<String> {
+        if let Some(cached) = self.superkingdoms.read().unwrap().get(&taxid) {
+            return cached.clone();
+        }
+
+        let lineage = self.lineage(taxid);
+        let result = lineage
+            .iter()
+            .find(|(_, rank, _)| rank == "superkingdom")
+            .map(|(_, _, name)| name.clone());
+
+        self.superkingdoms
+            .write()
+            .unwrap()
+            .insert(taxid, result.clone());
+        result
     }
 }
 
@@ -148,10 +171,14 @@ fn parse_nodes(path: &Path) -> Result<HashMap<u32, TaxNode>> {
             .trim_matches(|c: char| c.is_whitespace())
             .parse()
             .unwrap_or(taxid);
-        let rank = parts[2]
-            .trim_matches(|c: char| c.is_whitespace())
-            .to_string();
-        nodes.insert(taxid, TaxNode { parent, rank });
+        let rank = parts[2].trim_matches(|c: char| c.is_whitespace());
+        nodes.insert(
+            taxid,
+            TaxNode {
+                parent,
+                rank: canonicalize_rank(rank),
+            },
+        );
     }
     Ok(nodes)
 }

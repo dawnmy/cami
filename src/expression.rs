@@ -638,10 +638,8 @@ fn eval_taxonomy(entry: &Entry, taxonomy: &Taxonomy, op: &str, value: &str) -> b
                 if e == t {
                     return true;
                 }
-                taxonomy
-                    .ancestors_of(e)
-                    .iter()
-                    .any(|ancestor| *ancestor == t)
+                let ancestors = taxonomy.ancestors_of(e);
+                ancestors.iter().any(|ancestor| *ancestor == t)
             } else {
                 entry.taxpath.split('|').any(|tid| tid == value)
             }
@@ -651,10 +649,8 @@ fn eval_taxonomy(entry: &Entry, taxonomy: &Taxonomy, op: &str, value: &str) -> b
                 if e == t {
                     return false;
                 }
-                taxonomy
-                    .ancestors_of(e)
-                    .iter()
-                    .any(|ancestor| *ancestor == t)
+                let ancestors = taxonomy.ancestors_of(e);
+                ancestors.iter().any(|ancestor| *ancestor == t)
             } else {
                 entry
                     .taxpath

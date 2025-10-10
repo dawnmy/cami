@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail, ensure};
 use crate::cami;
 use crate::cami::{Entry, Sample};
 use crate::expression::{apply_filter, expr_needs_taxdump, parse_expression};
-use crate::taxonomy::{Taxonomy, ensure_taxdump};
+use crate::taxonomy::{Taxonomy, ensure_taxdump, parse_taxid};
 
 #[derive(Clone)]
 pub struct BenchmarkConfig {
@@ -60,9 +60,10 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
         .transpose()
         .context("parsing predicted-profile filter expression")?;
 
-    let needs_taxdump = all_expr
-        .as_ref()
-        .is_some_and(|expr| expr_needs_taxdump(expr))
+    let needs_taxdump = cfg.by_domain
+        || all_expr
+            .as_ref()
+            .is_some_and(|expr| expr_needs_taxdump(expr))
         || ground_expr
             .as_ref()
             .is_some_and(|expr| expr_needs_taxdump(expr))
@@ -145,6 +146,7 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
             ranks.as_ref(),
             cfg.normalize,
             domain.as_deref(),
+            taxonomy.as_ref(),
         );
 
         let mut sample_ids: Vec<_> = gt_map.keys().cloned().collect();
@@ -163,6 +165,7 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
                 ranks.as_ref(),
                 cfg.normalize,
                 domain.as_deref(),
+                taxonomy.as_ref(),
             );
 
             for sample_id in &sample_ids {
@@ -218,6 +221,7 @@ fn build_profile_map(
     ranks: Option<&Vec<String>>,
     normalize: bool,
     domain: Option<&str>,
+    taxonomy: Option<&Taxonomy>,
 ) -> HashMap<String, HashMap<String, Vec<ProfileEntry>>> {
     let mut map: HashMap<String, HashMap<String, Vec<ProfileEntry>>> = HashMap::new();
     let rank_filter: Option<BTreeSet<String>> = ranks.map(|r| r.iter().cloned().collect());
@@ -235,7 +239,7 @@ fn build_profile_map(
                 }
             }
             if let Some(domain) = &domain_lower {
-                if !entry_belongs_to_domain(entry, domain) {
+                if !entry_belongs_to_domain(entry, domain, taxonomy) {
                     continue;
                 }
             }
@@ -269,11 +273,14 @@ fn build_profile_map(
     map
 }
 
-fn entry_belongs_to_domain(entry: &Entry, domain: &str) -> bool {
+fn entry_belongs_to_domain(entry: &Entry, domain: &str, taxonomy: Option<&Taxonomy>) -> bool {
     entry.taxpathsn.split('|').any(|name| {
         let trimmed = name.trim();
         !trimmed.is_empty() && trimmed.eq_ignore_ascii_case(domain)
-    })
+    }) || taxonomy
+        .and_then(|tax| parse_taxid(&entry.taxid).and_then(|tid| tax.superkingdom_of(tid)))
+        .map(|sk| sk.eq_ignore_ascii_case(domain))
+        .unwrap_or(false)
 }
 
 #[derive(Default)]
