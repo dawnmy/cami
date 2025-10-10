@@ -274,13 +274,31 @@ fn build_profile_map(
 }
 
 fn entry_belongs_to_domain(entry: &Entry, domain: &str, taxonomy: Option<&Taxonomy>) -> bool {
-    entry.taxpathsn.split('|').any(|name| {
+    if entry.taxpathsn.split('|').any(|name| {
         let trimmed = name.trim();
         !trimmed.is_empty() && trimmed.eq_ignore_ascii_case(domain)
-    }) || taxonomy
-        .and_then(|tax| highest_taxid_in_taxpath(entry).and_then(|tid| tax.domain_of(tid)))
-        .map(|name| name.eq_ignore_ascii_case(domain))
-        .unwrap_or(false)
+    }) {
+        return true;
+    }
+
+    if let Some(tax) = taxonomy {
+        if let Some(tid) = highest_taxid_in_taxpath(entry) {
+            if let Some(name) = tax.domain_of(tid) {
+                if name.eq_ignore_ascii_case(domain) {
+                    return true;
+                }
+            }
+        }
+        if let Some(tid) = parse_taxid(&entry.taxid) {
+            if let Some(name) = tax.domain_of(tid) {
+                if name.eq_ignore_ascii_case(domain) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 fn highest_taxid_in_taxpath(entry: &Entry) -> Option<u32> {
@@ -292,7 +310,7 @@ fn highest_taxid_in_taxpath(entry: &Entry) -> Option<u32> {
             if tid.is_empty() {
                 None
             } else {
-                parse_taxid(tid)
+                parse_taxid(tid).filter(|id| *id > 1)
             }
         })
         .or_else(|| parse_taxid(&entry.taxid))
@@ -537,74 +555,49 @@ fn unifrac(
 
     let mut branches: HashMap<String, BranchStats> = HashMap::new();
 
-    for entry in &gt_positive {
-        let mass = if gt_total > 0.0 {
-            entry.percentage / gt_total
-        } else {
-            0.0
-        };
-        if mass <= 0.0 {
-            continue;
-        }
-        let parts = split_taxpath(&entry.taxpath);
-        add_branch_masses(&mut branches, &parts, mass, true);
-    }
-
-    for entry in &pred_positive {
-        let mass = if pred_total > 0.0 {
-            entry.percentage / pred_total
-        } else {
-            0.0
-        };
-        if mass <= 0.0 {
-            continue;
-        }
-        let parts = split_taxpath(&entry.taxpath);
-        add_branch_masses(&mut branches, &parts, mass, false);
-    }
+    accumulate_branch_masses(&mut branches, &gt_positive, gt_total, true);
+    accumulate_branch_masses(&mut branches, &pred_positive, pred_total, false);
 
     let mut weighted_numerator = 0.0;
     let mut weighted_denominator = 0.0;
     let mut unweighted_numerator = 0.0;
     let mut unweighted_denominator = 0.0;
+    let mut has_presence = false;
 
     for stats in branches.values() {
+        let gt_present = stats.gt_mass > 0.0;
+        let pred_present = stats.pred_mass > 0.0;
+        if !(gt_present || pred_present) {
+            continue;
+        }
+
+        has_presence = true;
+        let branch_length = 1.0;
         let diff = (stats.gt_mass - stats.pred_mass).abs();
         let sum = stats.gt_mass + stats.pred_mass;
-        weighted_numerator += diff;
-        weighted_denominator += sum;
 
-        if stats.gt_present || stats.pred_present {
-            unweighted_denominator += 1.0;
-            if stats.gt_present ^ stats.pred_present {
-                unweighted_numerator += 1.0;
-            }
+        weighted_numerator += diff * branch_length;
+        weighted_denominator += sum * branch_length;
+
+        unweighted_denominator += branch_length;
+        if gt_present ^ pred_present {
+            unweighted_numerator += branch_length;
         }
     }
 
     let weighted = if weighted_denominator > 0.0 {
-        let mut ratio = weighted_numerator / weighted_denominator;
-        if ratio < 0.0 {
-            ratio = 0.0;
-        } else if ratio > 1.0 {
-            ratio = 1.0;
-        }
-        Some(ratio)
-    } else if !gt_positive.is_empty() || !pred_positive.is_empty() {
+        let ratio = weighted_numerator / weighted_denominator;
+        Some(ratio.max(0.0).min(1.0))
+    } else if has_presence {
         Some(0.0)
     } else {
         None
     };
 
     let unweighted = if unweighted_denominator > 0.0 {
-        let mut ratio = unweighted_numerator / unweighted_denominator;
-        if ratio < 0.0 {
-            ratio = 0.0;
-        } else if ratio > 1.0 {
-            ratio = 1.0;
-        }
-        Some(ratio)
-    } else if !gt_positive.is_empty() || !pred_positive.is_empty() {
+        let ratio = unweighted_numerator / unweighted_denominator;
+        Some(ratio.max(0.0).min(1.0))
+    } else if has_presence {
         Some(0.0)
     } else {
         None
@@ -617,8 +610,6 @@ fn unifrac(
 struct BranchStats {
     gt_mass: f64,
     pred_mass: f64,
-    gt_present: bool,
-    pred_present: bool,
 }
 
 fn split_taxpath(path: &str) -> Vec<String> {
@@ -629,29 +620,38 @@ fn split_taxpath(path: &str) -> Vec<String> {
         .collect()
 }
 
-fn add_branch_masses(
+fn accumulate_branch_masses(
     branches: &mut HashMap<String, BranchStats>,
-    parts: &[String],
-    mass: f64,
+    entries: &[&ProfileEntry],
+    total: f64,
     is_gt: bool,
 ) {
-    if parts.is_empty() || mass <= 0.0 {
+    if total <= 0.0 {
         return;
     }
 
-    let mut key = String::new();
-    for (idx, part) in parts.iter().enumerate() {
-        if idx > 0 {
-            key.push('|');
+    for entry in entries {
+        let mass = entry.percentage / total;
+        if mass <= 0.0 {
+            continue;
         }
-        key.push_str(part);
-        let stats = branches.entry(key.clone()).or_default();
-        if is_gt {
-            stats.gt_mass += mass;
-            stats.gt_present = true;
-        } else {
-            stats.pred_mass += mass;
-            stats.pred_present = true;
+        let parts = split_taxpath(&entry.taxpath);
+        if parts.is_empty() {
+            continue;
+        }
+
+        let mut key = String::new();
+        for (idx, part) in parts.iter().enumerate() {
+            if idx > 0 {
+                key.push('|');
+            }
+            key.push_str(part);
+            let stats = branches.entry(key.clone()).or_default();
+            if is_gt {
+                stats.gt_mass += mass;
+            } else {
+                stats.pred_mass += mass;
+            }
         }
     }
 }
