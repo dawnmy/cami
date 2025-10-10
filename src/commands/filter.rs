@@ -1,5 +1,7 @@
 use crate::cami::{load_samples, open_output, write_cami};
-use crate::expression::{apply_filter, expr_needs_taxdump, parse_expression};
+use crate::expression::{
+    apply_filter, expr_needs_taxdump, parse_expression, validate_rank_selectors,
+};
 use crate::processing::{fill_up_to, renormalize};
 use crate::taxonomy::{Taxonomy, ensure_taxdump};
 use anyhow::{Context, Result, anyhow};
@@ -18,6 +20,7 @@ pub struct FilterConfig<'a> {
 pub fn run(cfg: &FilterConfig) -> Result<()> {
     let samples = load_samples(cfg.input)?;
     let expr = parse_expression(cfg.expression).context("parsing expression")?;
+    validate_rank_selectors(&expr, &samples)?;
     let needs_taxdump = expr_needs_taxdump(&expr) || cfg.fill_up;
 
     let taxonomy = if needs_taxdump {

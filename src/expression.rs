@@ -1,9 +1,9 @@
 use crate::cami::{Entry, Sample};
 use crate::taxonomy::{Taxonomy, parse_taxid};
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use regex::Regex;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 #[derive(Debug, Clone)]
 pub enum Expr {
@@ -267,38 +267,44 @@ fn eval_rank(atom: &str, sample: &Sample, entry: &Entry) -> Option<bool> {
     };
     let rest = rest.trim_start();
     if let Some(v) = rest.strip_prefix("!=") {
-        let values: Vec<&str> = v
-            .split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let values = parse_rank_list(v);
         if values.is_empty() {
-            return Some(entry.rank != v.trim());
+            let value = strip_quotes(v.trim());
+            return Some(entry.rank != value);
         }
         return Some(values.iter().all(|value| entry.rank != *value));
     }
     if let Some(v) = rest.strip_prefix("==") {
-        let values: Vec<&str> = v
-            .split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let values = parse_rank_list(v);
         if values.is_empty() {
-            return Some(entry.rank == v.trim());
+            let value = strip_quotes(v.trim());
+            return Some(entry.rank == value);
         }
         return Some(values.iter().any(|value| entry.rank == *value));
     }
     if let Some(v) = rest.strip_prefix("<=") {
-        return Some(rank_compare(sample, &entry.rank, v.trim(), |a, b| a >= b));
+        let value = strip_quotes(v.trim());
+        return Some(rank_compare(sample, &entry.rank, value.as_str(), |a, b| {
+            a >= b
+        }));
     }
     if let Some(v) = rest.strip_prefix("<") {
-        return Some(rank_compare(sample, &entry.rank, v.trim(), |a, b| a > b));
+        let value = strip_quotes(v.trim());
+        return Some(rank_compare(sample, &entry.rank, value.as_str(), |a, b| {
+            a > b
+        }));
     }
     if let Some(v) = rest.strip_prefix(">=") {
-        return Some(rank_compare(sample, &entry.rank, v.trim(), |a, b| a <= b));
+        let value = strip_quotes(v.trim());
+        return Some(rank_compare(sample, &entry.rank, value.as_str(), |a, b| {
+            a <= b
+        }));
     }
     if let Some(v) = rest.strip_prefix('>') {
-        return Some(rank_compare(sample, &entry.rank, v.trim(), |a, b| a < b));
+        let value = strip_quotes(v.trim());
+        return Some(rank_compare(sample, &entry.rank, value.as_str(), |a, b| {
+            a < b
+        }));
     }
     None
 }
@@ -552,6 +558,113 @@ fn split_unquoted(input: &str, delimiter: char) -> Vec<String> {
         parts.push(String::new());
     }
     parts
+}
+
+fn strip_quotes(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() >= 2
+        && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
+    {
+        trimmed[1..trimmed.len() - 1].to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn parse_rank_list(raw: &str) -> Vec<String> {
+    split_unquoted(raw, ',')
+        .into_iter()
+        .map(|s| strip_quotes(&s))
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+pub fn validate_rank_selectors(expr: &Expr, samples: &[Sample]) -> Result<()> {
+    let mut ranks = BTreeSet::new();
+    for sample in samples {
+        for rank in &sample.ranks {
+            ranks.insert(rank.clone());
+        }
+    }
+
+    if ranks.is_empty() {
+        return Ok(());
+    }
+
+    validate_rank_expr(expr, &ranks)
+}
+
+fn validate_rank_expr(expr: &Expr, ranks: &BTreeSet<String>) -> Result<()> {
+    match expr {
+        Expr::And(a, b) | Expr::Or(a, b) => {
+            validate_rank_expr(a, ranks)?;
+            validate_rank_expr(b, ranks)?;
+            Ok(())
+        }
+        Expr::Atom(atom) => validate_rank_atom(atom, ranks),
+    }
+}
+
+fn validate_rank_atom(atom: &str, ranks: &BTreeSet<String>) -> Result<()> {
+    if let Some(values) = extract_rank_values(atom) {
+        for value in values {
+            if !value.is_empty() && !ranks.contains(&value) {
+                let available = ranks.iter().cloned().collect::<Vec<_>>().join(", ");
+                bail!(
+                    "rank selector references '{}' which is not present in the @Ranks header; available ranks: {}",
+                    value,
+                    available
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn extract_rank_values(atom: &str) -> Option<Vec<String>> {
+    let rest = if let Some(r) = atom.strip_prefix("rank") {
+        r
+    } else if let Some(r) = atom.strip_prefix('r') {
+        r
+    } else {
+        return None;
+    };
+
+    let rest = rest.trim_start();
+    if let Some(v) = rest.strip_prefix("==") {
+        let values = parse_rank_list(v);
+        if values.is_empty() {
+            let single = strip_quotes(v.trim());
+            if single.is_empty() {
+                return Some(Vec::new());
+            }
+            return Some(vec![single]);
+        }
+        return Some(values);
+    }
+    if let Some(v) = rest.strip_prefix("!=") {
+        let values = parse_rank_list(v);
+        if values.is_empty() {
+            let single = strip_quotes(v.trim());
+            if single.is_empty() {
+                return Some(Vec::new());
+            }
+            return Some(vec![single]);
+        }
+        return Some(values);
+    }
+    for prefix in ["<=", "<", ">=", ">"] {
+        if let Some(v) = rest.strip_prefix(prefix) {
+            let value = strip_quotes(v.trim());
+            if value.is_empty() {
+                return Some(Vec::new());
+            }
+            return Some(vec![value]);
+        }
+    }
+
+    None
 }
 
 fn parse_selector_value(raw: &str) -> Option<(String, bool)> {
