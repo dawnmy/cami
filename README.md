@@ -157,6 +157,10 @@ profile   sample   rank     tp  fp  fn  precision  recall   f1        jaccard  l
 profiler1 s1       species  42  5   3   0.893617   0.933333  0.913043  0.777778 4.210000  0.021053     2.271111      2.318765       0.932842       0.950112        0.981000 0.975000 0.042000           0.018519              0.052632              0.041875
 ```
 
+### UniFrac normalization in CAMI benchmark
+
+The `cami benchmark` command reports weighted and unweighted UniFrac scores that are always between 0 and 1. Internally the tool builds a taxonomic tree from the lineages present in the ground-truth and predicted profiles, normalizes the mass present at each lineage tip, and then computes branch-wise discrepancies between the two distributions. The weighted variant sums the absolute differences in relative mass along every branch and divides by the theoretical maximum distance (placing all mass on mismatching leaves whose lowest common ancestor is the root). The unweighted variant measures how much branch length is missing relative to the gold-standard profile by dividing the length of branches present in exactly one profile by the total branch length that appears in the ground truth. Because every branch is treated as having length one, the reported values can be interpreted as the proportion of disagreement in the shared taxonomy. Missing intermediate ranks do not penalize a tool as long as both profiles share the same descendants—the implementation trims the lineages to a common depth before constructing the tree so that absent ancestors do not inflate the distance.
+
 ## Working with the filter language
 
 Expressions can be combined freely, allowing complex workflows:

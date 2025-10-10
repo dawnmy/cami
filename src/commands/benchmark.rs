@@ -601,8 +601,9 @@ fn unifrac(
     let mut totals = UniFracTotals::default();
     accumulate_unifrac(&root, &mut totals);
 
-    let weighted = if totals.weighted_denominator > 0.0 {
-        let ratio = totals.weighted_numerator / totals.weighted_denominator;
+    let weighted_max = 2.0 * (min_depth as f64);
+    let weighted = if weighted_max > 0.0 {
+        let ratio = totals.weighted_cost / weighted_max;
         Some(ratio.max(0.0).min(1.0))
     } else if totals.has_presence {
         Some(0.0)
@@ -610,8 +611,8 @@ fn unifrac(
         None
     };
 
-    let unweighted = if totals.unweighted_denominator > 0.0 {
-        let ratio = totals.unweighted_numerator / totals.unweighted_denominator;
+    let unweighted = if totals.gt_branch_length > 0.0 {
+        let ratio = totals.unweighted_cost / totals.gt_branch_length;
         Some(ratio.max(0.0).min(1.0))
     } else if totals.has_presence {
         Some(0.0)
@@ -636,10 +637,9 @@ struct UniFracEntry<'a> {
 
 #[derive(Default)]
 struct UniFracTotals {
-    weighted_numerator: f64,
-    weighted_denominator: f64,
-    unweighted_numerator: f64,
-    unweighted_denominator: f64,
+    weighted_cost: f64,
+    unweighted_cost: f64,
+    gt_branch_length: f64,
     has_presence: bool,
 }
 
@@ -687,16 +687,14 @@ fn accumulate_unifrac(node: &UniFracNode, totals: &mut UniFracTotals) {
         totals.has_presence = true;
         let branch_length = 1.0;
         let diff = (child.gt_mass - child.pred_mass).abs();
-        let sum = child.gt_mass + child.pred_mass;
+        totals.weighted_cost += diff * branch_length;
 
-        if sum > 0.0 {
-            totals.weighted_numerator += diff * branch_length;
-            totals.weighted_denominator += sum * branch_length;
+        if gt_present {
+            totals.gt_branch_length += branch_length;
         }
 
-        totals.unweighted_denominator += branch_length;
         if gt_present ^ pred_present {
-            totals.unweighted_numerator += branch_length;
+            totals.unweighted_cost += branch_length;
         }
 
         accumulate_unifrac(child, totals);
@@ -1065,11 +1063,11 @@ mod tests {
         let total = 100.0;
         let (weighted, unweighted) = unifrac(&gt, &pred, total, total);
         assert!((weighted.unwrap() - 0.5).abs() < 1e-9);
-        assert!((unweighted.unwrap() - (2.0 / 3.0)).abs() < 1e-9);
+        assert!((unweighted.unwrap() - 1.0).abs() < 1e-9);
     }
 
     #[test]
-    fn unweighted_unifrac_counts_union_branch_length_once() {
+    fn unweighted_unifrac_measures_relative_missing_branch_length() {
         let gt = vec![
             profile_entry_for_test("2|10", 60.0),
             profile_entry_for_test("2|11", 40.0),
@@ -1081,7 +1079,7 @@ mod tests {
         let gt_total = gt.iter().map(|e| e.percentage).sum();
         let pred_total = pred.iter().map(|e| e.percentage).sum();
         let (_, unweighted) = unifrac(&gt, &pred, gt_total, pred_total);
-        assert!((unweighted.unwrap() - 0.5).abs() < 1e-9);
+        assert!((unweighted.unwrap() - (2.0 / 3.0)).abs() < 1e-9);
     }
 
     #[test]
