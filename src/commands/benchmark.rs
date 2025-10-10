@@ -201,7 +201,7 @@ fn canonical_ranks(ranks: &[String]) -> Result<Vec<String>> {
 fn rank_is_above_phylum(rank: &str) -> bool {
     matches!(
         rank.trim().to_lowercase().as_str(),
-        "superkingdom" | "domain" | "kingdom"
+        "superkingdom" | "domain" | "kingdom" | "realm" | "cellular root" | "acellular root"
     )
 }
 
@@ -547,19 +547,50 @@ fn rank_values(values: &[f64]) -> Vec<f64> {
 fn unifrac(
     gt_entries: &[ProfileEntry],
     pred_entries: &[ProfileEntry],
-    gt_total: f64,
-    pred_total: f64,
+    _gt_total: f64,
+    _pred_total: f64,
 ) -> (Option<f64>, Option<f64>) {
-    let gt_positive: Vec<&ProfileEntry> = gt_entries
-        .iter()
-        .filter(|entry| entry.percentage > 0.0)
-        .collect();
-    let pred_positive: Vec<&ProfileEntry> = pred_entries
-        .iter()
-        .filter(|entry| entry.percentage > 0.0)
-        .collect();
+    let mut gt_positive: Vec<UniFracEntry> = Vec::new();
+    let mut pred_positive: Vec<UniFracEntry> = Vec::new();
+    let mut min_depth = usize::MAX;
+
+    for entry in gt_entries.iter().filter(|e| e.percentage > 0.0) {
+        let parts = parse_taxpath_ids(entry);
+        if parts.is_empty() {
+            continue;
+        }
+        min_depth = min_depth.min(parts.len());
+        gt_positive.push(UniFracEntry { entry, parts });
+    }
+
+    for entry in pred_entries.iter().filter(|e| e.percentage > 0.0) {
+        let parts = parse_taxpath_ids(entry);
+        if parts.is_empty() {
+            continue;
+        }
+        min_depth = min_depth.min(parts.len());
+        pred_positive.push(UniFracEntry { entry, parts });
+    }
 
     if gt_positive.is_empty() && pred_positive.is_empty() {
+        return (None, None);
+    }
+
+    if min_depth == usize::MAX || min_depth == 0 {
+        return (None, None);
+    }
+
+    for entry in gt_positive.iter_mut().chain(pred_positive.iter_mut()) {
+        if entry.parts.len() > min_depth {
+            let start = entry.parts.len() - min_depth;
+            entry.parts.drain(0..start);
+        }
+    }
+
+    let gt_total: f64 = gt_positive.iter().map(|e| e.entry.percentage).sum();
+    let pred_total: f64 = pred_positive.iter().map(|e| e.entry.percentage).sum();
+
+    if gt_total <= 0.0 && pred_total <= 0.0 {
         return (None, None);
     }
 
@@ -598,6 +629,11 @@ struct UniFracNode {
     children: HashMap<u32, UniFracNode>,
 }
 
+struct UniFracEntry<'a> {
+    entry: &'a ProfileEntry,
+    parts: Vec<u32>,
+}
+
 #[derive(Default)]
 struct UniFracTotals {
     weighted_numerator: f64,
@@ -607,22 +643,22 @@ struct UniFracTotals {
     has_presence: bool,
 }
 
-fn add_to_tree(root: &mut UniFracNode, entries: &[&ProfileEntry], total: f64, is_gt: bool) {
+fn add_to_tree(root: &mut UniFracNode, entries: &[UniFracEntry], total: f64, is_gt: bool) {
     if total <= 0.0 {
         return;
     }
 
     for entry in entries {
-        let mass = entry.percentage / total;
+        let mass = entry.entry.percentage / total;
         if mass <= 0.0 {
             continue;
         }
-        let parts = parse_taxpath_ids(&entry.taxpath);
+        let parts = &entry.parts;
         if parts.is_empty() {
             continue;
         }
 
-        add_mass_recursive(root, &parts, mass, is_gt);
+        add_mass_recursive(root, parts, mass, is_gt);
     }
 }
 
@@ -667,8 +703,10 @@ fn accumulate_unifrac(node: &UniFracNode, totals: &mut UniFracTotals) {
     }
 }
 
-fn parse_taxpath_ids(path: &str) -> Vec<u32> {
-    path.split('|')
+fn parse_taxpath_ids(entry: &ProfileEntry) -> Vec<u32> {
+    let mut parts: Vec<u32> = entry
+        .taxpath
+        .split('|')
         .filter_map(|part| {
             let trimmed = part.trim();
             if trimmed.is_empty() {
@@ -677,7 +715,15 @@ fn parse_taxpath_ids(path: &str) -> Vec<u32> {
                 parse_taxid(trimmed)
             }
         })
-        .collect()
+        .collect();
+
+    if parts.is_empty() {
+        if let Some(tid) = parse_taxid(&entry.taxid) {
+            parts.push(tid);
+        }
+    }
+
+    parts
 }
 
 fn abundance_rank_error(
@@ -1053,6 +1099,17 @@ mod tests {
         let (weighted, unweighted) = unifrac(&gt, &pred, gt_total, pred_total);
         assert!(weighted.unwrap() > 0.0 && weighted.unwrap() < 1.0);
         assert!(unweighted.unwrap() > 0.0 && unweighted.unwrap() < 1.0);
+    }
+
+    #[test]
+    fn weighted_unifrac_ignores_missing_ancestors() {
+        let gt = vec![profile_entry_for_test("1|2|3", 100.0)];
+        let pred = vec![profile_entry_for_test("2|3", 100.0)];
+        let gt_total: f64 = gt.iter().map(|e| e.percentage).sum();
+        let pred_total: f64 = pred.iter().map(|e| e.percentage).sum();
+        let (weighted, unweighted) = unifrac(&gt, &pred, gt_total, pred_total);
+        assert!(weighted.unwrap() < 1e-12);
+        assert!(unweighted.unwrap() < 1e-12);
     }
 
     #[test]
