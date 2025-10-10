@@ -64,6 +64,9 @@ pub fn fill_up_to(
         let mut existing_by_rank: HashMap<usize, Vec<String>> = HashMap::new();
         for entry in &sample.entries {
             if let Some(idx) = sample.rank_index(&entry.rank) {
+                if idx < start_idx || idx > end_idx {
+                    continue;
+                }
                 existing_by_key
                     .entry((idx, entry.taxid.clone()))
                     .or_insert_with(|| entry.clone());
@@ -107,6 +110,9 @@ pub fn fill_up_to(
 
         let mut new_entries: Vec<Entry> = Vec::new();
         for (idx, rank) in sample.ranks.iter().enumerate() {
+            if idx < start_idx || idx > end_idx {
+                continue;
+            }
             let mut taxids: BTreeSet<String> = BTreeSet::new();
             if let Some(existing) = existing_by_rank.get(&idx) {
                 for taxid in existing {
@@ -209,13 +215,21 @@ where
     F: FnMut() -> Option<HashMap<String, (String, String)>>,
 {
     if !cache.contains_key(taxid) {
-        if let Some(map) = build_rank_map(sample, taxonomy, taxid) {
-            cache.insert(taxid.to_string(), map);
-        } else if let Some(map) = fallback() {
-            cache.insert(taxid.to_string(), map);
-        } else {
-            cache.insert(taxid.to_string(), HashMap::new());
+        let mut map = build_rank_map(sample, taxonomy, taxid).unwrap_or_default();
+        let needs_fallback =
+            map.is_empty() || sample.ranks.iter().any(|rank| map.get(rank).is_none());
+        if needs_fallback {
+            if let Some(fallback_map) = fallback() {
+                if map.is_empty() {
+                    map = fallback_map;
+                } else {
+                    for (rank, value) in fallback_map {
+                        map.entry(rank).or_insert(value);
+                    }
+                }
+            }
         }
+        cache.insert(taxid.to_string(), map);
     }
     let map = cache.get(taxid)?;
     if map.is_empty() { None } else { Some(map) }
