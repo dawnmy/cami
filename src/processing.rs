@@ -21,8 +21,7 @@ pub fn renormalize(samples: &mut [Sample]) {
             }
             for &i in idxs {
                 if sample.entries[i].percentage > 0.0 {
-                    let normalized = sample.entries[i].percentage / sum * 100.0;
-                    sample.entries[i].percentage = (normalized * 100000.0).round() / 100000.0;
+                    sample.entries[i].percentage = sample.entries[i].percentage / sum * 100.0;
                 }
             }
         }

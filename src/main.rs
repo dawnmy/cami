@@ -204,7 +204,7 @@ enum Commands {
     },
     #[command(
         about = "Renormalize abundances per rank",
-        long_about = "Scale positive abundances within each rank of every sample so they sum to 100 and round the results to five decimal places."
+        long_about = "Scale positive abundances within each rank of every sample so they sum to 100 without altering their precision."
     )]
     Renorm {
         #[arg(
@@ -218,7 +218,7 @@ enum Commands {
     },
     #[command(
         about = "Fill missing ranks using taxonomy",
-        long_about = "Complete partial lineages in each sample by consulting the NCBI taxdump. Newly created abundances are rounded to five decimal places so the output stays tidy."
+        long_about = "Complete partial lineages in each sample by consulting the NCBI taxdump while preserving the numeric precision of existing abundances."
     )]
     Fillup {
         #[arg(
