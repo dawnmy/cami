@@ -568,6 +568,19 @@ const CANONICAL_RANKS: [&str; 7] = [
     "phylum", "class", "order", "family", "genus", "species", "strain",
 ];
 
+const BRANCH_LENGTHS: [f64; CANONICAL_RANKS.len()] = [1.0; CANONICAL_RANKS.len()];
+
+fn branch_length_for_level(level: usize) -> f64 {
+    BRANCH_LENGTHS
+        .get(level)
+        .copied()
+        .unwrap_or_else(|| BRANCH_LENGTHS.last().copied().unwrap_or(1.0))
+}
+
+fn cumulative_branch_length(rank_index: usize) -> f64 {
+    BRANCH_LENGTHS.iter().take(rank_index + 1).sum()
+}
+
 fn unifrac(
     rank: &str,
     gt_entries: &[ProfileEntry],
@@ -616,22 +629,9 @@ fn unifrac(
         }
     }
 
-    let (weighted_raw, unweighted_raw) = tree.compute_edge_flows();
+    let (weighted_raw, unweighted_raw, gt_unweighted_max) = tree.compute_edge_flows();
 
-    let mut support_gt = 0usize;
-    let mut support_pred = 0usize;
-    for node in &tree.nodes {
-        if node.rank_index == Some(rank_index) {
-            if node.gt_mass > 0.0 {
-                support_gt += 1;
-            }
-            if node.pred_mass > 0.0 {
-                support_pred += 1;
-            }
-        }
-    }
-
-    let path_length = (rank_index + 1) as f64;
+    let path_length = cumulative_branch_length(rank_index);
     let max_weighted = 2.0 * path_length;
     let weighted_raw = weighted_raw.max(0.0).min(max_weighted);
     let weighted_raw_opt = Some(weighted_raw);
@@ -640,15 +640,14 @@ fn unifrac(
     let unweighted_raw = unweighted_raw.max(0.0);
     let unweighted_raw_opt = Some(unweighted_raw);
 
-    let unweighted_support = support_gt + support_pred;
-    let unweighted_max = if unweighted_support > 0 {
-        Some(path_length * (unweighted_support as f64))
+    let unweighted_max = if gt_unweighted_max > 0.0 {
+        Some(gt_unweighted_max)
     } else {
         None
     };
 
     let unweighted_normalized = match (unweighted_raw_opt, unweighted_max) {
-        (Some(raw), Some(max)) if max > 0.0 => Some((raw / max).clamp(0.0, 1.0)),
+        (Some(raw), Some(max)) if max > 0.0 => Some(raw / max),
         _ => None,
     };
 
@@ -722,6 +721,7 @@ impl TaxTree {
             children: Vec::new(),
             gt_mass: 0.0,
             pred_mass: 0.0,
+            branch_length: 0.0,
         };
         Self {
             nodes: vec![root],
@@ -773,16 +773,18 @@ impl TaxTree {
             children: Vec::new(),
             gt_mass: 0.0,
             pred_mass: 0.0,
+            branch_length: branch_length_for_level(rank_index),
         });
         id
     }
 
-    fn compute_edge_flows(&self) -> (f64, f64) {
+    fn compute_edge_flows(&self) -> (f64, f64, f64) {
         fn dfs(
             tree: &TaxTree,
             node_id: usize,
             weighted: &mut f64,
             unweighted: &mut f64,
+            gt_unweighted: &mut f64,
         ) -> (f64, f64, bool, bool) {
             let node = &tree.nodes[node_id];
             let mut gt_mass = node.gt_mass;
@@ -792,11 +794,13 @@ impl TaxTree {
 
             for &child in &node.children {
                 let (child_gt_mass, child_pred_mass, child_gt_present, child_pred_present) =
-                    dfs(tree, child, weighted, unweighted);
-                *weighted += (child_gt_mass - child_pred_mass).abs();
+                    dfs(tree, child, weighted, unweighted, gt_unweighted);
+                let branch_length = tree.nodes[child].branch_length;
+                *weighted += branch_length * (child_gt_mass - child_pred_mass).abs();
                 let gt_flag: f64 = if child_gt_present { 1.0_f64 } else { 0.0_f64 };
                 let pred_flag: f64 = if child_pred_present { 1.0_f64 } else { 0.0_f64 };
-                *unweighted += (gt_flag - pred_flag).abs();
+                *unweighted += branch_length * (gt_flag - pred_flag).abs();
+                *gt_unweighted += branch_length * gt_flag;
                 gt_mass += child_gt_mass;
                 pred_mass += child_pred_mass;
                 gt_present |= child_gt_present;
@@ -808,8 +812,9 @@ impl TaxTree {
 
         let mut weighted = 0.0;
         let mut unweighted = 0.0;
-        let _ = dfs(self, 0, &mut weighted, &mut unweighted);
-        (weighted, unweighted)
+        let mut gt_unweighted = 0.0;
+        let _ = dfs(self, 0, &mut weighted, &mut unweighted, &mut gt_unweighted);
+        (weighted, unweighted, gt_unweighted)
     }
 }
 
@@ -819,6 +824,7 @@ struct TaxNode {
     children: Vec<usize>,
     gt_mass: f64,
     pred_mass: f64,
+    branch_length: f64,
 }
 
 fn abundance_rank_error(
@@ -1081,7 +1087,7 @@ fn taxonomy_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        CANONICAL_RANKS, ProfileEntry, abundance_rank_error, highest_taxid_in_taxpath,
+        ProfileEntry, abundance_rank_error, highest_taxid_in_taxpath,
         mass_weighted_abundance_rank_error, unifrac,
     };
     use crate::cami::Entry;
@@ -1148,6 +1154,7 @@ mod tests {
         assert!((result.weighted_raw.unwrap() - 14.0).abs() < 1e-9);
         assert!((result.weighted_normalized.unwrap() - 1.0).abs() < 1e-9);
         assert!((result.unweighted_raw.unwrap() - 14.0).abs() < 1e-9);
+        assert!((result.unweighted_normalized.unwrap() - 2.0).abs() < 1e-9);
     }
 
     #[test]
@@ -1162,10 +1169,12 @@ mod tests {
             profile_entry_for_test("sk|p|c|o|f|g3", 40.0),
         ];
         let result = unifrac(rank, &gt, &pred);
-        let path_length = (canonical_rank_index(rank).unwrap() + 1) as f64;
-        let expected_max = path_length * 4.0;
+        let baseline = unifrac(rank, &gt, &[]);
+        let expected_max = baseline.unweighted_raw.unwrap();
         assert!((result.unweighted_max.unwrap() - expected_max).abs() < 1e-9);
-        assert!(result.unweighted_normalized.unwrap() <= 1.0 + 1e-12);
+        let normalized = result.unweighted_normalized.unwrap();
+        let expected_normalized = result.unweighted_raw.unwrap() / expected_max;
+        assert!((normalized - expected_normalized).abs() < 1e-9);
     }
 
     #[test]
