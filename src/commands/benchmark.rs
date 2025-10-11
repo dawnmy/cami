@@ -138,7 +138,7 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
             .with_context(|| format!("creating benchmark report {}", path.display()))?;
         writeln!(
             writer,
-            "profile\tsample\trank\ttp\tfp\tfn\tprecision\trecall\tf1\tjaccard\tl1_error\tbray_curtis\tshannon_pred\tshannon_truth\tevenness_pred\tevenness_truth\tpearson\tspearman\tweighted_unifrac\tunweighted_unifrac\tabundance_rank_error\tmass_weighted_abundance_rank_error"
+            "profile\tsample\trank\ttp\tfp\tfn\tprecision\trecall\tf1\tjaccard\tl1_error\tbray_curtis\tshannon_pred\tshannon_truth\tevenness_pred\tevenness_truth\tpearson\tspearman\tweighted_unifrac_raw\tweighted_unifrac_normalized\tunweighted_unifrac_raw\tunweighted_unifrac_max\tunweighted_unifrac_normalized\tabundance_rank_error\tmass_weighted_abundance_rank_error"
         )?;
 
         let gt_map = build_profile_map(
@@ -184,7 +184,7 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
                         .and_then(|map| map.get(&rank))
                         .map(|v| v.as_slice())
                         .unwrap_or(&[]);
-                    let metrics = compute_metrics(gt_entries, pred_entries)?;
+                    let metrics = compute_metrics(&rank, gt_entries, pred_entries)?;
                     write_metrics(&mut writer, label, sample_id, &rank, &metrics)?;
                 }
             }
@@ -212,7 +212,9 @@ fn canonical_rank(rank: &str) -> Result<String> {
     }
     let lower = trimmed.to_lowercase();
     let canonical = match lower.as_str() {
-        "d" | "domain" | "superkingdom" => "superkingdom",
+        "d" | "domain" | "superkingdom" | "realm" | "cellular root" | "acellular root" => {
+            "superkingdom"
+        }
         "k" | "kingdom" => "kingdom",
         "p" | "phylum" => "phylum",
         "c" | "class" => "class",
@@ -343,13 +345,20 @@ struct Metrics {
     evenness_truth: Option<f64>,
     pearson: Option<f64>,
     spearman: Option<f64>,
-    weighted_unifrac: Option<f64>,
-    unweighted_unifrac: Option<f64>,
+    weighted_unifrac_raw: Option<f64>,
+    weighted_unifrac_normalized: Option<f64>,
+    unweighted_unifrac_raw: Option<f64>,
+    unweighted_unifrac_max: Option<f64>,
+    unweighted_unifrac_normalized: Option<f64>,
     abundance_rank_error: Option<f64>,
     mass_weighted_abundance_rank_error: Option<f64>,
 }
 
-fn compute_metrics(gt_entries: &[ProfileEntry], pred_entries: &[ProfileEntry]) -> Result<Metrics> {
+fn compute_metrics(
+    rank: &str,
+    gt_entries: &[ProfileEntry],
+    pred_entries: &[ProfileEntry],
+) -> Result<Metrics> {
     let mut metrics = Metrics::default();
     let mut gt_map: HashMap<String, f64> = HashMap::new();
     for entry in gt_entries {
@@ -449,9 +458,12 @@ fn compute_metrics(gt_entries: &[ProfileEntry], pred_entries: &[ProfileEntry]) -
     metrics.pearson = pearson(&gt_values, &pred_values);
     metrics.spearman = spearman(&gt_values, &pred_values);
 
-    let (weighted, unweighted) = unifrac(gt_entries, pred_entries, gt_total, pred_total);
-    metrics.weighted_unifrac = weighted;
-    metrics.unweighted_unifrac = unweighted;
+    let unifrac = unifrac(rank, gt_entries, pred_entries);
+    metrics.weighted_unifrac_raw = unifrac.weighted_raw;
+    metrics.weighted_unifrac_normalized = unifrac.weighted_normalized;
+    metrics.unweighted_unifrac_raw = unifrac.unweighted_raw;
+    metrics.unweighted_unifrac_max = unifrac.unweighted_max;
+    metrics.unweighted_unifrac_normalized = unifrac.unweighted_normalized;
     metrics.abundance_rank_error = Some(abundance_rank_error(&gt_map, &pred_map)?);
     metrics.mass_weighted_abundance_rank_error =
         Some(mass_weighted_abundance_rank_error(&gt_map, &pred_map, 1.0)?);
@@ -544,184 +556,275 @@ fn rank_values(values: &[f64]) -> Vec<f64> {
     ranks
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UniFracResult {
+    pub weighted_raw: Option<f64>,
+    pub weighted_normalized: Option<f64>,
+    pub unweighted_raw: Option<f64>,
+    pub unweighted_max: Option<f64>,
+    pub unweighted_normalized: Option<f64>,
+}
+
+const CANONICAL_RANKS: [&str; 8] = [
+    "superkingdom",
+    "phylum",
+    "class",
+    "order",
+    "family",
+    "genus",
+    "species",
+    "strain",
+];
+
 fn unifrac(
+    rank: &str,
     gt_entries: &[ProfileEntry],
     pred_entries: &[ProfileEntry],
-    _gt_total: f64,
-    _pred_total: f64,
-) -> (Option<f64>, Option<f64>) {
-    let mut gt_positive: Vec<UniFracEntry> = Vec::new();
-    let mut pred_positive: Vec<UniFracEntry> = Vec::new();
-    let mut min_depth = usize::MAX;
+) -> UniFracResult {
+    let Some(rank_index) = canonical_rank_index(rank) else {
+        return UniFracResult::default();
+    };
 
-    for entry in gt_entries.iter().filter(|e| e.percentage > 0.0) {
-        let parts = parse_taxpath_ids(entry);
-        if parts.is_empty() {
-            continue;
-        }
-        min_depth = min_depth.min(parts.len());
-        gt_positive.push(UniFracEntry { entry, parts });
-    }
-
-    for entry in pred_entries.iter().filter(|e| e.percentage > 0.0) {
-        let parts = parse_taxpath_ids(entry);
-        if parts.is_empty() {
-            continue;
-        }
-        min_depth = min_depth.min(parts.len());
-        pred_positive.push(UniFracEntry { entry, parts });
-    }
-
-    if gt_positive.is_empty() && pred_positive.is_empty() {
-        return (None, None);
-    }
-
-    if min_depth == usize::MAX || min_depth == 0 {
-        return (None, None);
-    }
-
-    for entry in gt_positive.iter_mut().chain(pred_positive.iter_mut()) {
-        if entry.parts.len() > min_depth {
-            let start = entry.parts.len() - min_depth;
-            entry.parts.drain(0..start);
-        }
-    }
-
-    let gt_total: f64 = gt_positive.iter().map(|e| e.entry.percentage).sum();
-    let pred_total: f64 = pred_positive.iter().map(|e| e.entry.percentage).sum();
+    let gt_total: f64 = gt_entries
+        .iter()
+        .filter(|e| e.percentage > 0.0)
+        .map(|e| e.percentage)
+        .sum();
+    let pred_total: f64 = pred_entries
+        .iter()
+        .filter(|e| e.percentage > 0.0)
+        .map(|e| e.percentage)
+        .sum();
 
     if gt_total <= 0.0 && pred_total <= 0.0 {
-        return (None, None);
+        return UniFracResult::default();
     }
 
-    let mut root = UniFracNode::default();
-    add_to_tree(&mut root, &gt_positive, gt_total, true);
-    add_to_tree(&mut root, &pred_positive, pred_total, false);
+    let mut tree = TaxTree::new();
 
-    let mut totals = UniFracTotals::default();
-    accumulate_unifrac(&root, &mut totals);
+    if gt_total > 0.0 {
+        for entry in gt_entries.iter().filter(|e| e.percentage > 0.0) {
+            let mass = entry.percentage / gt_total;
+            if !mass.is_finite() || mass <= 0.0 {
+                continue;
+            }
+            let path = parse_taxpath(entry);
+            tree.add_mass(&path, rank_index, mass, true);
+        }
+    }
 
-    let weighted_max = 2.0 * (min_depth as f64);
-    let weighted = if weighted_max > 0.0 {
-        let ratio = totals.weighted_cost / weighted_max;
-        Some(ratio.max(0.0).min(1.0))
-    } else if totals.has_presence {
-        Some(0.0)
+    if pred_total > 0.0 {
+        for entry in pred_entries.iter().filter(|e| e.percentage > 0.0) {
+            let mass = entry.percentage / pred_total;
+            if !mass.is_finite() || mass <= 0.0 {
+                continue;
+            }
+            let path = parse_taxpath(entry);
+            tree.add_mass(&path, rank_index, mass, false);
+        }
+    }
+
+    let (weighted_raw, unweighted_raw) = tree.compute_edge_flows();
+
+    let mut support_sum = 0usize;
+    for node in &tree.nodes {
+        if let Some(node_rank) = node.rank_index {
+            if node_rank > rank_index {
+                continue;
+            }
+            if node.gt_mass > 0.0 {
+                support_sum += 1;
+            }
+            if node.pred_mass > 0.0 {
+                support_sum += 1;
+            }
+        }
+    }
+
+    let weighted_raw = weighted_raw.max(0.0);
+    let weighted_raw = weighted_raw.min(16.0);
+    let weighted_raw_opt = Some(weighted_raw);
+    let weighted_normalized = Some((weighted_raw / 16.0).clamp(0.0, 1.0));
+
+    let unweighted_raw = unweighted_raw.max(0.0);
+    let unweighted_raw_opt = Some(unweighted_raw);
+
+    let unweighted_max = if support_sum > 0 {
+        let ranks_minus_one = (CANONICAL_RANKS.len() - 1) as f64;
+        Some(ranks_minus_one * (support_sum as f64))
     } else {
         None
     };
 
-    let unweighted = if totals.gt_branch_length > 0.0 {
-        let ratio = totals.unweighted_cost / totals.gt_branch_length;
-        Some(ratio.max(0.0).min(1.0))
-    } else if totals.has_presence {
-        Some(0.0)
-    } else {
-        None
+    let unweighted_normalized = match (unweighted_raw_opt, unweighted_max) {
+        (Some(raw), Some(max)) if max > 0.0 => Some((raw / max).clamp(0.0, 1.0)),
+        _ => None,
     };
 
-    (weighted, unweighted)
-}
-
-#[derive(Default)]
-struct UniFracNode {
-    gt_mass: f64,
-    pred_mass: f64,
-    children: HashMap<u32, UniFracNode>,
-}
-
-struct UniFracEntry<'a> {
-    entry: &'a ProfileEntry,
-    parts: Vec<u32>,
-}
-
-#[derive(Default)]
-struct UniFracTotals {
-    weighted_cost: f64,
-    unweighted_cost: f64,
-    gt_branch_length: f64,
-    has_presence: bool,
-}
-
-fn add_to_tree(root: &mut UniFracNode, entries: &[UniFracEntry], total: f64, is_gt: bool) {
-    if total <= 0.0 {
-        return;
-    }
-
-    for entry in entries {
-        let mass = entry.entry.percentage / total;
-        if mass <= 0.0 {
-            continue;
-        }
-        let parts = &entry.parts;
-        if parts.is_empty() {
-            continue;
-        }
-
-        add_mass_recursive(root, parts, mass, is_gt);
+    UniFracResult {
+        weighted_raw: weighted_raw_opt,
+        weighted_normalized,
+        unweighted_raw: unweighted_raw_opt,
+        unweighted_max,
+        unweighted_normalized,
     }
 }
 
-fn add_mass_recursive(node: &mut UniFracNode, parts: &[u32], mass: f64, is_gt: bool) {
-    if parts.is_empty() {
-        return;
-    }
-
-    let child = node.children.entry(parts[0]).or_default();
-    if is_gt {
-        child.gt_mass += mass;
-    } else {
-        child.pred_mass += mass;
-    }
-    add_mass_recursive(child, &parts[1..], mass, is_gt);
-}
-
-fn accumulate_unifrac(node: &UniFracNode, totals: &mut UniFracTotals) {
-    for child in node.children.values() {
-        let gt_present = child.gt_mass > 0.0;
-        let pred_present = child.pred_mass > 0.0;
-        if !(gt_present || pred_present) {
-            continue;
-        }
-
-        totals.has_presence = true;
-        let branch_length = 1.0;
-        let diff = (child.gt_mass - child.pred_mass).abs();
-        totals.weighted_cost += diff * branch_length;
-
-        if gt_present {
-            totals.gt_branch_length += branch_length;
-        }
-
-        if gt_present ^ pred_present {
-            totals.unweighted_cost += branch_length;
-        }
-
-        accumulate_unifrac(child, totals);
+fn canonical_rank_index(rank: &str) -> Option<usize> {
+    let canonical = canonical_rank(rank).ok()?;
+    match canonical.as_str() {
+        "superkingdom" | "domain" | "kingdom" => Some(0),
+        "phylum" => Some(1),
+        "class" => Some(2),
+        "order" => Some(3),
+        "family" => Some(4),
+        "genus" => Some(5),
+        "species" => Some(6),
+        "strain" => Some(7),
+        _ => None,
     }
 }
 
-fn parse_taxpath_ids(entry: &ProfileEntry) -> Vec<u32> {
-    let mut parts: Vec<u32> = entry
+fn parse_taxpath(entry: &ProfileEntry) -> Vec<Option<String>> {
+    let mut parts: Vec<Option<String>> = entry
         .taxpath
         .split('|')
-        .filter_map(|part| {
+        .map(|part| {
             let trimmed = part.trim();
             if trimmed.is_empty() {
                 None
             } else {
-                parse_taxid(trimmed)
+                Some(trimmed.to_string())
             }
         })
         .collect();
 
     if parts.is_empty() {
-        if let Some(tid) = parse_taxid(&entry.taxid) {
-            parts.push(tid);
+        let trimmed = entry.taxid.trim();
+        if !trimmed.is_empty() {
+            parts.push(Some(trimmed.to_string()));
         }
     }
 
+    if parts.len() > CANONICAL_RANKS.len() {
+        parts.truncate(CANONICAL_RANKS.len());
+    }
+
+    if parts.len() < CANONICAL_RANKS.len() {
+        parts.resize(CANONICAL_RANKS.len(), None);
+    }
+
     parts
+}
+
+struct TaxTree {
+    nodes: Vec<TaxNode>,
+    index: HashMap<(usize, String), usize>,
+}
+
+impl TaxTree {
+    fn new() -> Self {
+        let root = TaxNode {
+            name: "root".to_string(),
+            rank_index: None,
+            children: Vec::new(),
+            gt_mass: 0.0,
+            pred_mass: 0.0,
+        };
+        Self {
+            nodes: vec![root],
+            index: HashMap::new(),
+        }
+    }
+
+    fn add_mass(&mut self, path: &[Option<String>], rank_index: usize, mass: f64, is_gt: bool) {
+        if mass <= 0.0 {
+            return;
+        }
+
+        let mut parent = 0usize;
+        let mut parent_name = self.nodes[parent].name.clone();
+        let mut target_node = parent;
+
+        for level in 0..CANONICAL_RANKS.len() {
+            let node_name = match path.get(level).and_then(|p| p.clone()) {
+                Some(name) => name,
+                None => format!("__missing_{}_under_{}", CANONICAL_RANKS[level], parent_name),
+            };
+            let child = self.get_or_create_child(parent, level, node_name.clone());
+            parent = child;
+            if level == rank_index {
+                target_node = child;
+            }
+            parent_name = node_name;
+        }
+
+        if is_gt {
+            self.nodes[target_node].gt_mass += mass;
+        } else {
+            self.nodes[target_node].pred_mass += mass;
+        }
+    }
+
+    fn get_or_create_child(&mut self, parent: usize, rank_index: usize, name: String) -> usize {
+        let key = (parent, name.clone());
+        if let Some(id) = self.index.get(&key) {
+            return *id;
+        }
+
+        let id = self.nodes.len();
+        self.index.insert(key, id);
+        self.nodes[parent].children.push(id);
+        self.nodes.push(TaxNode {
+            name,
+            rank_index: Some(rank_index),
+            children: Vec::new(),
+            gt_mass: 0.0,
+            pred_mass: 0.0,
+        });
+        id
+    }
+
+    fn compute_edge_flows(&self) -> (f64, f64) {
+        fn dfs(
+            tree: &TaxTree,
+            node_id: usize,
+            weighted: &mut f64,
+            unweighted: &mut f64,
+        ) -> (f64, f64, f64, f64) {
+            let node = &tree.nodes[node_id];
+            let mut gt_mass = node.gt_mass;
+            let mut pred_mass = node.pred_mass;
+            let mut gt_presence = if node.gt_mass > 0.0 { 1.0 } else { 0.0 };
+            let mut pred_presence = if node.pred_mass > 0.0 { 1.0 } else { 0.0 };
+
+            for &child in &node.children {
+                let (child_gt_mass, child_pred_mass, child_gt_presence, child_pred_presence) =
+                    dfs(tree, child, weighted, unweighted);
+                *weighted += (child_gt_mass - child_pred_mass).abs();
+                *unweighted += (child_gt_presence - child_pred_presence).abs();
+                gt_mass += child_gt_mass;
+                pred_mass += child_pred_mass;
+                gt_presence += child_gt_presence;
+                pred_presence += child_pred_presence;
+            }
+
+            (gt_mass, pred_mass, gt_presence, pred_presence)
+        }
+
+        let mut weighted = 0.0;
+        let mut unweighted = 0.0;
+        let _ = dfs(self, 0, &mut weighted, &mut unweighted);
+        (weighted, unweighted)
+    }
+}
+
+struct TaxNode {
+    name: String,
+    rank_index: Option<usize>,
+    children: Vec<usize>,
+    gt_mass: f64,
+    pred_mass: f64,
 }
 
 fn abundance_rank_error(
@@ -935,7 +1038,7 @@ fn write_metrics<W: Write>(
 ) -> Result<()> {
     writeln!(
         writer,
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         label,
         sample,
         rank,
@@ -954,8 +1057,11 @@ fn write_metrics<W: Write>(
         format_opt(metrics.evenness_truth),
         format_opt(metrics.pearson),
         format_opt(metrics.spearman),
-        format_opt(metrics.weighted_unifrac),
-        format_opt(metrics.unweighted_unifrac),
+        format_opt(metrics.weighted_unifrac_raw),
+        format_opt(metrics.weighted_unifrac_normalized),
+        format_opt(metrics.unweighted_unifrac_raw),
+        format_opt(metrics.unweighted_unifrac_max),
+        format_opt(metrics.unweighted_unifrac_normalized),
         format_opt(metrics.abundance_rank_error),
         format_opt(metrics.mass_weighted_abundance_rank_error)
     )?;
@@ -981,7 +1087,7 @@ fn taxonomy_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProfileEntry, abundance_rank_error, highest_taxid_in_taxpath,
+        CANONICAL_RANKS, ProfileEntry, abundance_rank_error, highest_taxid_in_taxpath,
         mass_weighted_abundance_rank_error, unifrac,
     };
     use crate::cami::Entry;
@@ -1024,90 +1130,65 @@ mod tests {
     }
 
     #[test]
-    fn weighted_unifrac_identical_profiles_are_zero() {
+    fn unifrac_identical_profiles_are_zero() {
+        let rank = "species";
         let gt = vec![
-            profile_entry_for_test("2|10", 60.0),
-            profile_entry_for_test("2|11", 40.0),
+            profile_entry_for_test("sk|p|c|o|f|g|s", 60.0),
+            profile_entry_for_test("sk|p|c|o|f|h|i", 40.0),
         ];
         let pred = vec![
-            profile_entry_for_test("2|10", 60.0),
-            profile_entry_for_test("2|11", 40.0),
+            profile_entry_for_test("sk|p|c|o|f|g|s", 60.0),
+            profile_entry_for_test("sk|p|c|o|f|h|i", 40.0),
         ];
-        let total = gt.iter().map(|e| e.percentage).sum();
-        let (weighted, unweighted) = unifrac(&gt, &pred, total, total);
-        assert!(weighted.unwrap() < 1e-12);
-        assert!(unweighted.unwrap() < 1e-12);
+        let result = unifrac(rank, &gt, &pred);
+        assert!(result.weighted_raw.unwrap() < 1e-12);
+        assert!(result.unweighted_raw.unwrap() < 1e-12);
     }
 
     #[test]
-    fn weighted_unifrac_distinguishes_abundance_shifts() {
+    fn unifrac_strain_singletons_on_opposite_branches_reach_max() {
+        let rank = "strain";
+        let gt = vec![profile_entry_for_test("a|b|c|d|e|f|g|t1", 100.0)];
+        let pred = vec![profile_entry_for_test("z|y|x|w|v|u|s|t2", 100.0)];
+        let result = unifrac(rank, &gt, &pred);
+        assert!((result.weighted_raw.unwrap() - 16.0).abs() < 1e-9);
+        assert!((result.weighted_normalized.unwrap() - 1.0).abs() < 1e-9);
+        assert!((result.unweighted_raw.unwrap() - 16.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn unweighted_unifrac_max_follows_opal_formula() {
+        let rank = "genus";
         let gt = vec![
-            profile_entry_for_test("2|10", 60.0),
-            profile_entry_for_test("2|11", 40.0),
+            profile_entry_for_test("sk|p|c|o|f|g1", 60.0),
+            profile_entry_for_test("sk|p|c|o|f|g2", 40.0),
         ];
         let pred = vec![
-            profile_entry_for_test("2|10", 20.0),
-            profile_entry_for_test("2|11", 80.0),
+            profile_entry_for_test("sk|p|c|o|f|g1", 60.0),
+            profile_entry_for_test("sk|p|c|o|f|g3", 40.0),
         ];
-        let gt_total: f64 = gt.iter().map(|e| e.percentage).sum();
-        let pred_total: f64 = pred.iter().map(|e| e.percentage).sum();
-        let (weighted, unweighted) = unifrac(&gt, &pred, gt_total, pred_total);
-        assert!((weighted.unwrap() - 0.2).abs() < 1e-9);
-        assert!(unweighted.unwrap() < 1e-12);
+        let result = unifrac(rank, &gt, &pred);
+        let expected_max = (CANONICAL_RANKS.len() - 1) as f64 * 4.0;
+        assert!((result.unweighted_max.unwrap() - expected_max).abs() < 1e-9);
+        assert!(result.unweighted_normalized.unwrap() <= 1.0 + 1e-12);
     }
 
     #[test]
-    fn weighted_unifrac_handles_disjoint_taxa() {
-        let gt = vec![profile_entry_for_test("2|10", 100.0)];
-        let pred = vec![profile_entry_for_test("2|11", 100.0)];
-        let total = 100.0;
-        let (weighted, unweighted) = unifrac(&gt, &pred, total, total);
-        assert!((weighted.unwrap() - 0.5).abs() < 1e-9);
-        assert!((unweighted.unwrap() - 1.0).abs() < 1e-9);
-    }
+    fn weighted_unifrac_is_monotonic_with_deeper_mismatch() {
+        let rank = "strain";
+        let gt = vec![profile_entry_for_test("sk|p|c|o|f|g1|s1|t1", 100.0)];
+        let pred_genus = vec![profile_entry_for_test("sk|p|c|o|f|g2", 100.0)];
+        let pred_strain = vec![profile_entry_for_test("sk|p|c|o|f|g2|s2|t2", 100.0)];
 
-    #[test]
-    fn unweighted_unifrac_measures_relative_missing_branch_length() {
-        let gt = vec![
-            profile_entry_for_test("2|10", 60.0),
-            profile_entry_for_test("2|11", 40.0),
-        ];
-        let pred = vec![
-            profile_entry_for_test("2|10", 50.0),
-            profile_entry_for_test("2|12", 50.0),
-        ];
-        let gt_total = gt.iter().map(|e| e.percentage).sum();
-        let pred_total = pred.iter().map(|e| e.percentage).sum();
-        let (_, unweighted) = unifrac(&gt, &pred, gt_total, pred_total);
-        assert!((unweighted.unwrap() - (2.0 / 3.0)).abs() < 1e-9);
-    }
+        let result_genus = unifrac(rank, &gt, &pred_genus);
+        let result_strain = unifrac(rank, &gt, &pred_strain);
 
-    #[test]
-    fn weighted_unifrac_partial_overlap_is_fractional() {
-        let gt = vec![
-            profile_entry_for_test("2|10|20", 40.0),
-            profile_entry_for_test("2|10|21", 60.0),
-        ];
-        let pred = vec![
-            profile_entry_for_test("2|10|20", 40.0),
-            profile_entry_for_test("2|11|22", 60.0),
-        ];
-        let gt_total: f64 = gt.iter().map(|e| e.percentage).sum();
-        let pred_total: f64 = pred.iter().map(|e| e.percentage).sum();
-        let (weighted, unweighted) = unifrac(&gt, &pred, gt_total, pred_total);
-        assert!(weighted.unwrap() > 0.0 && weighted.unwrap() < 1.0);
-        assert!(unweighted.unwrap() > 0.0 && unweighted.unwrap() < 1.0);
-    }
+        let genus_raw = result_genus.weighted_raw.unwrap();
+        let strain_raw = result_strain.weighted_raw.unwrap();
 
-    #[test]
-    fn weighted_unifrac_ignores_missing_ancestors() {
-        let gt = vec![profile_entry_for_test("1|2|3", 100.0)];
-        let pred = vec![profile_entry_for_test("2|3", 100.0)];
-        let gt_total: f64 = gt.iter().map(|e| e.percentage).sum();
-        let pred_total: f64 = pred.iter().map(|e| e.percentage).sum();
-        let (weighted, unweighted) = unifrac(&gt, &pred, gt_total, pred_total);
-        assert!(weighted.unwrap() < 1e-12);
-        assert!(unweighted.unwrap() < 1e-12);
+        assert!(genus_raw > 0.0 && genus_raw < 16.0);
+        assert!(strain_raw >= genus_raw - 1e-9);
+        assert!(strain_raw <= 16.0);
     }
 
     #[test]
