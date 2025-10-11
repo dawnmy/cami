@@ -101,7 +101,7 @@ When `--fill-up` is supplied, the command downloads the NCBI taxdump (stored und
 
 ### `cami fillup`
 
-Populate missing higher ranks for every sample using the NCBI taxdump. Abundances are rounded to five decimal places once the hierarchy is filled.
+Populate missing higher ranks for every sample using the NCBI taxdump. Abundances retain their full precision after the hierarchy is filled.
 
 ```bash
 cami fillup --to-rank family examples/test.cami > with_family.cami
@@ -111,7 +111,7 @@ If `--to-rank` is omitted, the command fills to the highest rank declared in eac
 
 ### `cami renorm`
 
-Renormalize abundances so that the percentages at each rank sum to 100 for every sample. Entries with zero or negative abundances are ignored during scaling, and positive values are rounded to five decimal places.
+Renormalize abundances so that the percentages at each rank sum to 100 for every sample. Entries with zero or negative abundances are ignored during scaling, and positive values keep their full double-precision values.
 
 ```bash
 cami renorm examples/test.cami > renormalized.cami

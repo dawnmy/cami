@@ -271,7 +271,6 @@ fn build_profile_map(
                 if sum > 0.0 {
                     for entry in entries.iter_mut() {
                         entry.percentage = entry.percentage / sum * 100.0;
-                        entry.percentage = (entry.percentage * 100000.0).round() / 100000.0;
                     }
                 }
             }
