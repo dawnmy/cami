@@ -577,10 +577,6 @@ fn branch_length_for_level(level: usize) -> f64 {
         .unwrap_or_else(|| BRANCH_LENGTHS.last().copied().unwrap_or(1.0))
 }
 
-fn cumulative_branch_length(rank_index: usize) -> f64 {
-    BRANCH_LENGTHS.iter().take(rank_index + 1).sum()
-}
-
 fn unifrac(
     rank: &str,
     gt_entries: &[ProfileEntry],
@@ -631,7 +627,7 @@ fn unifrac(
 
     let (weighted_raw, unweighted_raw, gt_unweighted_max) = tree.compute_edge_flows();
 
-    let path_length = cumulative_branch_length(rank_index);
+    let path_length = BRANCH_LENGTHS.iter().copied().sum::<f64>();
     let max_weighted = 2.0 * path_length;
     let weighted_raw = weighted_raw.max(0.0).min(max_weighted);
     let weighted_raw_opt = Some(weighted_raw);
@@ -717,7 +713,6 @@ impl TaxTree {
     fn new() -> Self {
         let root = TaxNode {
             name: "root".to_string(),
-            rank_index: None,
             parent: None,
             children: Vec::new(),
             gt_mass: 0.0,
@@ -770,7 +765,6 @@ impl TaxTree {
         self.nodes[parent].children.push(id);
         self.nodes.push(TaxNode {
             name,
-            rank_index: Some(rank_index),
             parent: Some(parent),
             children: Vec::new(),
             gt_mass: 0.0,
@@ -781,22 +775,12 @@ impl TaxTree {
     }
 
     fn compute_edge_flows(&self) -> (f64, f64, f64) {
-        let mut weighted = 0.0;
-        let mut diff: Vec<f64> = self
-            .nodes
-            .iter()
-            .map(|node| node.gt_mass - node.pred_mass)
-            .collect();
-
-        for node_id in (1..self.nodes.len()).rev() {
-            let node = &self.nodes[node_id];
-            let flow = diff[node_id];
-            weighted += node.branch_length * flow.abs();
-            if let Some(parent) = node.parent {
-                diff[parent] += flow;
-            }
-            diff[node_id] = 0.0;
-        }
+        let weighted = self.flow_cost(
+            self.nodes
+                .iter()
+                .map(|node| node.gt_mass - node.pred_mass)
+                .collect(),
+        );
 
         let mut gt_present = vec![false; self.nodes.len()];
         let mut pred_present = vec![false; self.nodes.len()];
@@ -820,31 +804,46 @@ impl TaxTree {
             }
         }
 
-        let mut unweighted = 0.0;
-        let mut gt_unweighted = 0.0;
-        for node_id in 1..self.nodes.len() {
-            let node = &self.nodes[node_id];
-            let gt_flag = if gt_present[node_id] {
-                1.0_f64
-            } else {
-                0.0_f64
-            };
-            let pred_flag = if pred_present[node_id] {
-                1.0_f64
-            } else {
-                0.0_f64
-            };
-            unweighted += node.branch_length * (gt_flag - pred_flag).abs();
-            gt_unweighted += node.branch_length * gt_flag;
-        }
+        let gt_flags: Vec<f64> = gt_present
+            .iter()
+            .map(|present| if *present { 1.0 } else { 0.0 })
+            .collect();
+        let pred_flags: Vec<f64> = pred_present
+            .iter()
+            .map(|present| if *present { 1.0 } else { 0.0 })
+            .collect();
+
+        let gt_unweighted = self.flow_cost(gt_flags.clone());
+        let unweighted = self.flow_cost(
+            gt_flags
+                .iter()
+                .zip(pred_flags.iter())
+                .map(|(g, p)| g - p)
+                .collect(),
+        );
 
         (weighted, unweighted, gt_unweighted)
+    }
+
+    fn flow_cost(&self, mut diff: Vec<f64>) -> f64 {
+        let mut cost = 0.0;
+        for node_id in (1..self.nodes.len()).rev() {
+            let node = &self.nodes[node_id];
+            let flow = diff[node_id];
+            if flow != 0.0 {
+                cost += node.branch_length * flow.abs();
+                if let Some(parent) = node.parent {
+                    diff[parent] += flow;
+                }
+                diff[node_id] = 0.0;
+            }
+        }
+        cost
     }
 }
 
 struct TaxNode {
     name: String,
-    rank_index: Option<usize>,
     parent: Option<usize>,
     children: Vec<usize>,
     gt_mass: f64,
