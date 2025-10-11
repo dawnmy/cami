@@ -794,8 +794,8 @@ impl TaxTree {
                 let (child_gt_mass, child_pred_mass, child_gt_present, child_pred_present) =
                     dfs(tree, child, weighted, unweighted);
                 *weighted += (child_gt_mass - child_pred_mass).abs();
-                let gt_flag = if child_gt_present { 1.0 } else { 0.0 };
-                let pred_flag = if child_pred_present { 1.0 } else { 0.0 };
+                let gt_flag: f64 = if child_gt_present { 1.0_f64 } else { 0.0_f64 };
+                let pred_flag: f64 = if child_pred_present { 1.0_f64 } else { 0.0_f64 };
                 *unweighted += (gt_flag - pred_flag).abs();
                 gt_mass += child_gt_mass;
                 pred_mass += child_pred_mass;
