@@ -718,6 +718,7 @@ impl TaxTree {
         let root = TaxNode {
             name: "root".to_string(),
             rank_index: None,
+            parent: None,
             children: Vec::new(),
             gt_mass: 0.0,
             pred_mass: 0.0,
@@ -770,6 +771,7 @@ impl TaxTree {
         self.nodes.push(TaxNode {
             name,
             rank_index: Some(rank_index),
+            parent: Some(parent),
             children: Vec::new(),
             gt_mass: 0.0,
             pred_mass: 0.0,
@@ -779,41 +781,63 @@ impl TaxTree {
     }
 
     fn compute_edge_flows(&self) -> (f64, f64, f64) {
-        fn dfs(
-            tree: &TaxTree,
-            node_id: usize,
-            weighted: &mut f64,
-            unweighted: &mut f64,
-            gt_unweighted: &mut f64,
-        ) -> (f64, f64, bool, bool) {
-            let node = &tree.nodes[node_id];
-            let mut gt_mass = node.gt_mass;
-            let mut pred_mass = node.pred_mass;
-            let mut gt_present = node.gt_mass > 0.0;
-            let mut pred_present = node.pred_mass > 0.0;
+        let mut weighted = 0.0;
+        let mut diff: Vec<f64> = self
+            .nodes
+            .iter()
+            .map(|node| node.gt_mass - node.pred_mass)
+            .collect();
 
-            for &child in &node.children {
-                let (child_gt_mass, child_pred_mass, child_gt_present, child_pred_present) =
-                    dfs(tree, child, weighted, unweighted, gt_unweighted);
-                let branch_length = tree.nodes[child].branch_length;
-                *weighted += branch_length * (child_gt_mass - child_pred_mass).abs();
-                let gt_flag: f64 = if child_gt_present { 1.0_f64 } else { 0.0_f64 };
-                let pred_flag: f64 = if child_pred_present { 1.0_f64 } else { 0.0_f64 };
-                *unweighted += branch_length * (gt_flag - pred_flag).abs();
-                *gt_unweighted += branch_length * gt_flag;
-                gt_mass += child_gt_mass;
-                pred_mass += child_pred_mass;
-                gt_present |= child_gt_present;
-                pred_present |= child_pred_present;
+        for node_id in (1..self.nodes.len()).rev() {
+            let node = &self.nodes[node_id];
+            let flow = diff[node_id];
+            weighted += node.branch_length * flow.abs();
+            if let Some(parent) = node.parent {
+                diff[parent] += flow;
             }
-
-            (gt_mass, pred_mass, gt_present, pred_present)
+            diff[node_id] = 0.0;
         }
 
-        let mut weighted = 0.0;
+        let mut gt_present = vec![false; self.nodes.len()];
+        let mut pred_present = vec![false; self.nodes.len()];
+        for (idx, node) in self.nodes.iter().enumerate() {
+            if node.gt_mass > 0.0 {
+                gt_present[idx] = true;
+            }
+            if node.pred_mass > 0.0 {
+                pred_present[idx] = true;
+            }
+        }
+
+        for node_id in (1..self.nodes.len()).rev() {
+            if let Some(parent) = self.nodes[node_id].parent {
+                if gt_present[node_id] {
+                    gt_present[parent] = true;
+                }
+                if pred_present[node_id] {
+                    pred_present[parent] = true;
+                }
+            }
+        }
+
         let mut unweighted = 0.0;
         let mut gt_unweighted = 0.0;
-        let _ = dfs(self, 0, &mut weighted, &mut unweighted, &mut gt_unweighted);
+        for node_id in 1..self.nodes.len() {
+            let node = &self.nodes[node_id];
+            let gt_flag = if gt_present[node_id] {
+                1.0_f64
+            } else {
+                0.0_f64
+            };
+            let pred_flag = if pred_present[node_id] {
+                1.0_f64
+            } else {
+                0.0_f64
+            };
+            unweighted += node.branch_length * (gt_flag - pred_flag).abs();
+            gt_unweighted += node.branch_length * gt_flag;
+        }
+
         (weighted, unweighted, gt_unweighted)
     }
 }
@@ -821,6 +845,7 @@ impl TaxTree {
 struct TaxNode {
     name: String,
     rank_index: Option<usize>,
+    parent: Option<usize>,
     children: Vec<usize>,
     gt_mass: f64,
     pred_mass: f64,
