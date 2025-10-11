@@ -564,15 +564,8 @@ pub struct UniFracResult {
     pub unweighted_normalized: Option<f64>,
 }
 
-const CANONICAL_RANKS: [&str; 8] = [
-    "superkingdom",
-    "phylum",
-    "class",
-    "order",
-    "family",
-    "genus",
-    "species",
-    "strain",
+const CANONICAL_RANKS: [&str; 7] = [
+    "phylum", "class", "order", "family", "genus", "species", "strain",
 ];
 
 fn unifrac(
@@ -625,32 +618,31 @@ fn unifrac(
 
     let (weighted_raw, unweighted_raw) = tree.compute_edge_flows();
 
-    let mut support_sum = 0usize;
+    let mut support_gt = 0usize;
+    let mut support_pred = 0usize;
     for node in &tree.nodes {
-        if let Some(node_rank) = node.rank_index {
-            if node_rank > rank_index {
-                continue;
-            }
+        if node.rank_index == Some(rank_index) {
             if node.gt_mass > 0.0 {
-                support_sum += 1;
+                support_gt += 1;
             }
             if node.pred_mass > 0.0 {
-                support_sum += 1;
+                support_pred += 1;
             }
         }
     }
 
-    let weighted_raw = weighted_raw.max(0.0);
-    let weighted_raw = weighted_raw.min(16.0);
+    let path_length = (rank_index + 1) as f64;
+    let max_weighted = 2.0 * path_length;
+    let weighted_raw = weighted_raw.max(0.0).min(max_weighted);
     let weighted_raw_opt = Some(weighted_raw);
-    let weighted_normalized = Some((weighted_raw / 16.0).clamp(0.0, 1.0));
+    let weighted_normalized = Some((weighted_raw / max_weighted).clamp(0.0, 1.0));
 
     let unweighted_raw = unweighted_raw.max(0.0);
     let unweighted_raw_opt = Some(unweighted_raw);
 
-    let unweighted_max = if support_sum > 0 {
-        let ranks_minus_one = (CANONICAL_RANKS.len() - 1) as f64;
-        Some(ranks_minus_one * (support_sum as f64))
+    let unweighted_support = support_gt + support_pred;
+    let unweighted_max = if unweighted_support > 0 {
+        Some(path_length * (unweighted_support as f64))
     } else {
         None
     };
@@ -672,14 +664,13 @@ fn unifrac(
 fn canonical_rank_index(rank: &str) -> Option<usize> {
     let canonical = canonical_rank(rank).ok()?;
     match canonical.as_str() {
-        "superkingdom" | "domain" | "kingdom" => Some(0),
-        "phylum" => Some(1),
-        "class" => Some(2),
-        "order" => Some(3),
-        "family" => Some(4),
-        "genus" => Some(5),
-        "species" => Some(6),
-        "strain" => Some(7),
+        "phylum" => Some(0),
+        "class" => Some(1),
+        "order" => Some(2),
+        "family" => Some(3),
+        "genus" => Some(4),
+        "species" => Some(5),
+        "strain" => Some(6),
         _ => None,
     }
 }
@@ -706,11 +697,13 @@ fn parse_taxpath(entry: &ProfileEntry) -> Vec<Option<String>> {
     }
 
     if parts.len() > CANONICAL_RANKS.len() {
-        parts.truncate(CANONICAL_RANKS.len());
+        parts = parts.split_off(parts.len() - CANONICAL_RANKS.len());
     }
 
     if parts.len() < CANONICAL_RANKS.len() {
-        parts.resize(CANONICAL_RANKS.len(), None);
+        let mut padded = vec![None; CANONICAL_RANKS.len() - parts.len()];
+        padded.extend(parts.into_iter());
+        parts = padded;
     }
 
     parts
@@ -790,25 +783,27 @@ impl TaxTree {
             node_id: usize,
             weighted: &mut f64,
             unweighted: &mut f64,
-        ) -> (f64, f64, f64, f64) {
+        ) -> (f64, f64, bool, bool) {
             let node = &tree.nodes[node_id];
             let mut gt_mass = node.gt_mass;
             let mut pred_mass = node.pred_mass;
-            let mut gt_presence = if node.gt_mass > 0.0 { 1.0 } else { 0.0 };
-            let mut pred_presence = if node.pred_mass > 0.0 { 1.0 } else { 0.0 };
+            let mut gt_present = node.gt_mass > 0.0;
+            let mut pred_present = node.pred_mass > 0.0;
 
             for &child in &node.children {
-                let (child_gt_mass, child_pred_mass, child_gt_presence, child_pred_presence) =
+                let (child_gt_mass, child_pred_mass, child_gt_present, child_pred_present) =
                     dfs(tree, child, weighted, unweighted);
                 *weighted += (child_gt_mass - child_pred_mass).abs();
-                *unweighted += (child_gt_presence - child_pred_presence).abs();
+                let gt_flag = if child_gt_present { 1.0 } else { 0.0 };
+                let pred_flag = if child_pred_present { 1.0 } else { 0.0 };
+                *unweighted += (gt_flag - pred_flag).abs();
                 gt_mass += child_gt_mass;
                 pred_mass += child_pred_mass;
-                gt_presence += child_gt_presence;
-                pred_presence += child_pred_presence;
+                gt_present |= child_gt_present;
+                pred_present |= child_pred_present;
             }
 
-            (gt_mass, pred_mass, gt_presence, pred_presence)
+            (gt_mass, pred_mass, gt_present, pred_present)
         }
 
         let mut weighted = 0.0;
@@ -1150,9 +1145,9 @@ mod tests {
         let gt = vec![profile_entry_for_test("a|b|c|d|e|f|g|t1", 100.0)];
         let pred = vec![profile_entry_for_test("z|y|x|w|v|u|s|t2", 100.0)];
         let result = unifrac(rank, &gt, &pred);
-        assert!((result.weighted_raw.unwrap() - 16.0).abs() < 1e-9);
+        assert!((result.weighted_raw.unwrap() - 14.0).abs() < 1e-9);
         assert!((result.weighted_normalized.unwrap() - 1.0).abs() < 1e-9);
-        assert!((result.unweighted_raw.unwrap() - 16.0).abs() < 1e-9);
+        assert!((result.unweighted_raw.unwrap() - 14.0).abs() < 1e-9);
     }
 
     #[test]
@@ -1167,7 +1162,8 @@ mod tests {
             profile_entry_for_test("sk|p|c|o|f|g3", 40.0),
         ];
         let result = unifrac(rank, &gt, &pred);
-        let expected_max = (CANONICAL_RANKS.len() - 1) as f64 * 4.0;
+        let path_length = (canonical_rank_index(rank).unwrap() + 1) as f64;
+        let expected_max = path_length * 4.0;
         assert!((result.unweighted_max.unwrap() - expected_max).abs() < 1e-9);
         assert!(result.unweighted_normalized.unwrap() <= 1.0 + 1e-12);
     }
@@ -1185,9 +1181,9 @@ mod tests {
         let genus_raw = result_genus.weighted_raw.unwrap();
         let strain_raw = result_strain.weighted_raw.unwrap();
 
-        assert!(genus_raw > 0.0 && genus_raw < 16.0);
+        assert!(genus_raw > 0.0 && genus_raw < 14.0);
         assert!(strain_raw >= genus_raw - 1e-9);
-        assert!(strain_raw <= 16.0);
+        assert!(strain_raw <= 14.0);
     }
 
     #[test]
