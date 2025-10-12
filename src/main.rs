@@ -6,6 +6,7 @@ mod taxonomy;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
+use std::io;
 use std::path::PathBuf;
 
 use commands::{
@@ -67,6 +68,12 @@ enum Commands {
             help = "Predicted CAMI profiles to benchmark."
         )]
         predictions: Vec<PathBuf>,
+        #[arg(
+            short = 'u',
+            long = "update-taxonomy",
+            help = "Refresh taxonomy fields from the local NCBI taxdump when benchmarking."
+        )]
+        update_taxonomy: bool,
         #[arg(
             short = 'l',
             long = "labels",
@@ -203,7 +210,7 @@ enum Commands {
     },
     #[command(
         about = "Renormalize abundances per rank",
-        long_about = "Scale positive abundances within each rank of every sample so they sum to 100 and round the results to five decimal places."
+        long_about = "Scale positive abundances within each rank of every sample so they sum to 100 without altering their precision."
     )]
     Renorm {
         #[arg(
@@ -217,7 +224,7 @@ enum Commands {
     },
     #[command(
         about = "Fill missing ranks using taxonomy",
-        long_about = "Complete partial lineages in each sample by consulting the NCBI taxdump. Newly created abundances are rounded to five decimal places so the output stays tidy."
+        long_about = "Complete partial lineages in each sample by consulting the NCBI taxdump while preserving the numeric precision of existing abundances."
     )]
     Fillup {
         #[arg(
@@ -272,10 +279,11 @@ enum Commands {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    match &cli.command {
+    let result = match &cli.command {
         Commands::Benchmark {
             ground_truth,
             predictions,
+            update_taxonomy,
             labels,
             all_filter,
             ground_filter,
@@ -290,6 +298,7 @@ fn main() -> Result<()> {
             let cfg = BenchmarkRunConfig {
                 ground_truth: ground_truth.clone(),
                 predictions: predictions.clone(),
+                update_taxonomy: *update_taxonomy,
                 labels: label_vec,
                 all_filter: all_filter.clone(),
                 ground_filter: ground_filter.clone(),
@@ -375,5 +384,19 @@ fn main() -> Result<()> {
             };
             sort_cmd::run(&cfg)
         }
+    };
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) if is_broken_pipe(&err) => Ok(()),
+        Err(err) => Err(err),
     }
+}
+
+fn is_broken_pipe(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| match cause.downcast_ref::<io::Error>() {
+            Some(io_err) => io_err.kind() == io::ErrorKind::BrokenPipe,
+            None => false,
+        })
 }

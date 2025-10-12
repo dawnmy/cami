@@ -101,7 +101,7 @@ When `--fill-up` is supplied, the command downloads the NCBI taxdump (stored und
 
 ### `cami fillup`
 
-Populate missing higher ranks for every sample using the NCBI taxdump. Abundances are rounded to five decimal places once the hierarchy is filled.
+Populate missing higher ranks for every sample using the NCBI taxdump. Abundances retain their full precision after the hierarchy is filled.
 
 ```bash
 cami fillup --to-rank family examples/test.cami > with_family.cami
@@ -111,7 +111,7 @@ If `--to-rank` is omitted, the command fills to the highest rank declared in eac
 
 ### `cami renorm`
 
-Renormalize abundances so that the percentages at each rank sum to 100 for every sample. Entries with zero or negative abundances are ignored during scaling, and positive values are rounded to five decimal places.
+Renormalize abundances so that the percentages at each rank sum to 100 for every sample. Entries with zero or negative abundances are ignored during scaling, and positive values keep their full double-precision values.
 
 ```bash
 cami renorm examples/test.cami > renormalized.cami
@@ -156,6 +156,12 @@ Each TSV contains one row per profile/sample/rank combination:
 profile   sample   rank     tp  fp  fn  precision  recall   f1        jaccard  l1_error  bray_curtis  shannon_pred  shannon_truth  evenness_pred  evenness_truth  pearson  spearman  weighted_unifrac  unweighted_unifrac  abundance_rank_error  mass_weighted_abundance_rank_error
 profiler1 s1       species  42  5   3   0.893617   0.933333  0.913043  0.777778 4.210000  0.021053     2.271111      2.318765       0.932842       0.950112        0.981000 0.975000 0.042000           0.018519              0.052632              0.041875
 ```
+
+### UniFrac normalization in CAMI benchmark
+
+The `cami benchmark` command reports weighted and unweighted UniFrac scores that are always between 0 and 1. Internally the tool builds a taxonomic tree from the lineages present in the ground-truth and predicted profiles, normalizes the mass present at each lineage tip, and then computes branch-wise discrepancies between the two distributions. To avoid ambiguous superkingdom/domain assignments, the UniFrac implementation only considers the canonical ranks `phylum`, `class`, `order`, `family`, `genus`, `species`, and `strain` when building the comparison tree.
+
+For a given evaluation rank the weighted variant sums the absolute differences in relative mass along every branch down to that rank and divides by the maximum possible distance (placing all mass on mismatching leaves whose lowest common ancestor is the root for the depth being evaluated). The unweighted variant measures how much branch length is unique to either profile by counting the number of phylum-to-rank edges that appear exclusively in the ground truth or the prediction and dividing by the maximum number of such edges given the observed support in each profile. Because every branch is treated as having length one, the reported values can be interpreted as the proportion of disagreement in the shared taxonomy. Missing intermediate ranks do not penalize a tool as long as both profiles share the same descendants—the implementation trims and right-aligns the lineages to a common depth before constructing the tree so that absent ancestors do not inflate the distance.
 
 ## Working with the filter language
 
