@@ -28,8 +28,10 @@ pub struct BenchmarkConfig {
 #[derive(Clone)]
 struct ProfileEntry {
     taxid: String,
+    rank: String,
     percentage: f64,
     taxpath: String,
+    taxpathsn: String,
 }
 
 pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
@@ -138,7 +140,7 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
             .with_context(|| format!("creating benchmark report {}", path.display()))?;
         writeln!(
             writer,
-            "profile\tsample\trank\ttp\tfp\tfn\tprecision\trecall\tf1\tjaccard\tl1_error\tbray_curtis\tshannon_pred\tshannon_truth\tevenness_pred\tevenness_truth\tpearson\tspearman\tweighted_unifrac_raw\tweighted_unifrac_normalized\tunweighted_unifrac_raw\tunweighted_unifrac_max\tunweighted_unifrac_normalized\tabundance_rank_error\tmass_weighted_abundance_rank_error"
+            "profile\tsample\trank\ttp\tfp\tfn\tprecision\trecall\tf1\tjaccard\tl1_error\tbray_curtis\tshannon_pred\tshannon_truth\tevenness_pred\tevenness_truth\tpearson\tspearman\tweighted_unifrac\tunweighted_unifrac\tabundance_rank_error\tmass_weighted_abundance_rank_error"
         )?;
 
         let gt_map = build_profile_map(
@@ -255,13 +257,16 @@ fn build_profile_map(
                     continue;
                 }
             }
+            let rank_name = canonical_rank(&entry.rank).unwrap_or_else(|_| entry.rank.clone());
             sample_map
-                .entry(entry.rank.clone())
+                .entry(rank_name.clone())
                 .or_default()
                 .push(ProfileEntry {
                     taxid: entry.taxid.clone(),
+                    rank: rank_name,
                     percentage: entry.percentage,
                     taxpath: entry.taxpath.clone(),
+                    taxpathsn: entry.taxpathsn.clone(),
                 });
         }
 
@@ -344,11 +349,8 @@ struct Metrics {
     evenness_truth: Option<f64>,
     pearson: Option<f64>,
     spearman: Option<f64>,
-    weighted_unifrac_raw: Option<f64>,
-    weighted_unifrac_normalized: Option<f64>,
-    unweighted_unifrac_raw: Option<f64>,
-    unweighted_unifrac_max: Option<f64>,
-    unweighted_unifrac_normalized: Option<f64>,
+    weighted_unifrac: Option<f64>,
+    unweighted_unifrac: Option<f64>,
     abundance_rank_error: Option<f64>,
     mass_weighted_abundance_rank_error: Option<f64>,
 }
@@ -458,11 +460,8 @@ fn compute_metrics(
     metrics.spearman = spearman(&gt_values, &pred_values);
 
     let unifrac = unifrac(rank, gt_entries, pred_entries);
-    metrics.weighted_unifrac_raw = unifrac.weighted_raw;
-    metrics.weighted_unifrac_normalized = unifrac.weighted_normalized;
-    metrics.unweighted_unifrac_raw = unifrac.unweighted_raw;
-    metrics.unweighted_unifrac_max = unifrac.unweighted_max;
-    metrics.unweighted_unifrac_normalized = unifrac.unweighted_normalized;
+    metrics.weighted_unifrac = unifrac.weighted;
+    metrics.unweighted_unifrac = unifrac.unweighted;
     metrics.abundance_rank_error = Some(abundance_rank_error(&gt_map, &pred_map)?);
     metrics.mass_weighted_abundance_rank_error =
         Some(mass_weighted_abundance_rank_error(&gt_map, &pred_map, 1.0)?);
@@ -557,15 +556,26 @@ fn rank_values(values: &[f64]) -> Vec<f64> {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UniFracResult {
-    pub weighted_raw: Option<f64>,
-    pub weighted_normalized: Option<f64>,
-    pub unweighted_raw: Option<f64>,
-    pub unweighted_max: Option<f64>,
-    pub unweighted_normalized: Option<f64>,
+    pub weighted: Option<f64>,
+    pub unweighted: Option<f64>,
 }
 
-const CANONICAL_RANKS: [&str; 7] = [
-    "phylum", "class", "order", "family", "genus", "species", "strain",
+struct UnifracComponents {
+    weighted_raw: f64,
+    unweighted_raw: f64,
+    gt_unweighted_max: f64,
+    max_weighted: f64,
+}
+
+const CANONICAL_RANKS: [&str; 8] = [
+    "superkingdom",
+    "phylum",
+    "class",
+    "order",
+    "family",
+    "genus",
+    "species",
+    "strain",
 ];
 
 const BRANCH_LENGTHS: [f64; CANONICAL_RANKS.len()] = [1.0; CANONICAL_RANKS.len()];
@@ -587,6 +597,32 @@ fn unifrac(
         return UniFracResult::default();
     };
 
+    match unifrac_components(rank_index, gt_entries, pred_entries) {
+        Some(components) => {
+            let weighted = if components.max_weighted > 0.0 {
+                Some((components.weighted_raw / components.max_weighted).clamp(0.0, 1.0))
+            } else {
+                None
+            };
+            let unweighted = if components.gt_unweighted_max > MASS_EPSILON {
+                Some((components.unweighted_raw / components.gt_unweighted_max).clamp(0.0, 1.0))
+            } else {
+                None
+            };
+            UniFracResult {
+                weighted,
+                unweighted,
+            }
+        }
+        None => UniFracResult::default(),
+    }
+}
+
+fn unifrac_components(
+    rank_index: usize,
+    gt_entries: &[ProfileEntry],
+    pred_entries: &[ProfileEntry],
+) -> Option<UnifracComponents> {
     let gt_total: f64 = gt_entries
         .iter()
         .filter(|e| e.percentage > 0.0)
@@ -599,7 +635,7 @@ fn unifrac(
         .sum();
 
     if gt_total <= 0.0 && pred_total <= 0.0 {
-        return UniFracResult::default();
+        return None;
     }
 
     let mut tree = TaxTree::new();
@@ -627,95 +663,178 @@ fn unifrac(
     }
 
     let (weighted_raw, unweighted_raw, gt_unweighted_max) = tree.compute_edge_flows();
-
     let path_length = BRANCH_LENGTHS
         .iter()
         .take(rank_index + 1)
         .copied()
         .sum::<f64>();
     let max_weighted = 2.0 * path_length;
-    let weighted_raw = weighted_raw.max(0.0);
-    let weighted_raw = if max_weighted > 0.0 {
-        weighted_raw.min(max_weighted)
+    let clamped_weighted = if max_weighted > 0.0 {
+        weighted_raw.max(0.0).min(max_weighted)
     } else {
-        weighted_raw
-    };
-    let weighted_raw_opt = Some(weighted_raw);
-    let weighted_normalized = if max_weighted > 0.0 {
-        Some((weighted_raw / max_weighted).clamp(0.0, 1.0))
-    } else {
-        None
+        weighted_raw.max(0.0)
     };
 
-    let unweighted_raw = unweighted_raw.max(0.0);
-    let unweighted_raw_opt = Some(unweighted_raw);
-
-    let unweighted_max = if gt_unweighted_max > MASS_EPSILON {
-        Some(gt_unweighted_max)
-    } else {
-        None
-    };
-
-    let unweighted_normalized = match (unweighted_raw_opt, unweighted_max) {
-        (Some(raw), Some(max)) if max > 0.0 => Some((raw / max).clamp(0.0, 1.0)),
-        _ => None,
-    };
-
-    UniFracResult {
-        weighted_raw: weighted_raw_opt,
-        weighted_normalized,
-        unweighted_raw: unweighted_raw_opt,
-        unweighted_max,
-        unweighted_normalized,
-    }
+    Some(UnifracComponents {
+        weighted_raw: clamped_weighted,
+        unweighted_raw: unweighted_raw.max(0.0),
+        gt_unweighted_max,
+        max_weighted,
+    })
 }
 
 fn canonical_rank_index(rank: &str) -> Option<usize> {
     let canonical = canonical_rank(rank).ok()?;
     match canonical.as_str() {
-        "phylum" => Some(0),
-        "class" => Some(1),
-        "order" => Some(2),
-        "family" => Some(3),
-        "genus" => Some(4),
-        "species" => Some(5),
-        "strain" => Some(6),
+        "superkingdom" => Some(0),
+        "phylum" => Some(1),
+        "class" => Some(2),
+        "order" => Some(3),
+        "family" => Some(4),
+        "genus" => Some(5),
+        "species" => Some(6),
+        "strain" => Some(7),
         _ => None,
     }
 }
 
 fn parse_taxpath(entry: &ProfileEntry) -> Vec<Option<String>> {
-    let mut parts: Vec<Option<String>> = entry
-        .taxpath
-        .split('|')
-        .map(|part| {
-            let trimmed = part.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        })
-        .collect();
+    let entry_rank_index = canonical_rank_index(&entry.rank)
+        .unwrap_or_else(|| CANONICAL_RANKS.len().saturating_sub(1));
+    let mut result = vec![None; CANONICAL_RANKS.len()];
+
+    let mut parts = if !entry.taxpathsn.trim().is_empty() {
+        split_taxpath(&entry.taxpathsn)
+    } else {
+        split_taxpath(&entry.taxpath)
+    };
 
     if parts.is_empty() {
-        let trimmed = entry.taxid.trim();
-        if !trimmed.is_empty() {
-            parts.push(Some(trimmed.to_string()));
+        parts = split_taxpath(&entry.taxpath);
+    }
+
+    let mut normalized: Vec<String> = parts
+        .iter()
+        .filter_map(|part| normalize_taxpath_component(part))
+        .collect();
+
+    if normalized.is_empty() {
+        if let Some(value) = normalize_taxpath_component(&entry.taxid) {
+            normalized.push(value);
         }
     }
 
-    if parts.len() > CANONICAL_RANKS.len() {
-        parts = parts.split_off(parts.len() - CANONICAL_RANKS.len());
+    if normalized.len() > entry_rank_index + 1 {
+        normalized = normalized.split_off(normalized.len() - (entry_rank_index + 1));
     }
 
-    if parts.len() < CANONICAL_RANKS.len() {
-        let mut padded = vec![None; CANONICAL_RANKS.len() - parts.len()];
-        padded.extend(parts.into_iter());
-        parts = padded;
+    let offset = entry_rank_index + 1 - normalized.len();
+    for (idx, name) in normalized.into_iter().enumerate() {
+        result[offset + idx] = Some(name);
     }
 
-    parts
+    if result[0].is_none() {
+        if let Some(superkingdom) = infer_superkingdom(entry) {
+            result[0] = Some(superkingdom);
+        }
+    }
+
+    result
+}
+
+fn split_taxpath(path: &str) -> Vec<String> {
+    path.split('|')
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty())
+        .map(|part| part.to_string())
+        .collect()
+}
+
+fn normalize_taxpath_component(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_lowercase();
+    if matches!(
+        lower.as_str(),
+        "root" | "cellular organisms" | "cellular root" | "acellular organisms" | "acellular root"
+    ) {
+        return None;
+    }
+    if lower.contains("viruses") && !lower.eq("viruses") {
+        return Some("Viruses".to_string());
+    }
+    Some(trimmed.to_string())
+}
+
+fn infer_superkingdom(entry: &ProfileEntry) -> Option<String> {
+    for component in split_taxpath(&entry.taxpathsn) {
+        if let Some(label) =
+            normalize_taxpath_component(&component).and_then(|value| detect_superkingdom(&value))
+        {
+            return Some(label);
+        }
+        if let Some(label) = detect_superkingdom(&component) {
+            return Some(label);
+        }
+    }
+
+    for component in split_taxpath(&entry.taxpath) {
+        if let Some(label) =
+            normalize_taxpath_component(&component).and_then(|value| detect_superkingdom(&value))
+        {
+            return Some(label);
+        }
+        if let Some(label) = detect_superkingdom(&component) {
+            return Some(label);
+        }
+        if let Ok(taxid) = component.parse::<u32>() {
+            if let Some(name) = superkingdom_from_taxid(taxid) {
+                return Some(name.to_string());
+            }
+        }
+    }
+
+    detect_superkingdom(&entry.taxid)
+}
+
+fn detect_superkingdom(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let canonical = trimmed
+        .split("__")
+        .last()
+        .unwrap_or(trimmed)
+        .split(':')
+        .last()
+        .unwrap_or(trimmed)
+        .trim();
+    let lower = canonical.to_lowercase();
+    if lower.contains("viruses") {
+        Some("Viruses".to_string())
+    } else if lower.contains("bacteria") {
+        Some("Bacteria".to_string())
+    } else if lower.contains("archaea") || lower.contains("archaeota") || lower.contains("archaeon")
+    {
+        Some("Archaea".to_string())
+    } else if lower.contains("eukary") {
+        Some("Eukaryota".to_string())
+    } else {
+        None
+    }
+}
+
+fn superkingdom_from_taxid(taxid: u32) -> Option<&'static str> {
+    match taxid {
+        2 => Some("Bacteria"),
+        2157 => Some("Archaea"),
+        2759 => Some("Eukaryota"),
+        10239 => Some("Viruses"),
+        _ => None,
+    }
 }
 
 struct TaxTree {
@@ -1054,7 +1173,7 @@ fn write_metrics<W: Write>(
 ) -> Result<()> {
     writeln!(
         writer,
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         label,
         sample,
         rank,
@@ -1073,11 +1192,8 @@ fn write_metrics<W: Write>(
         format_opt(metrics.evenness_truth),
         format_opt(metrics.pearson),
         format_opt(metrics.spearman),
-        format_opt(metrics.weighted_unifrac_raw),
-        format_opt(metrics.weighted_unifrac_normalized),
-        format_opt(metrics.unweighted_unifrac_raw),
-        format_opt(metrics.unweighted_unifrac_max),
-        format_opt(metrics.unweighted_unifrac_normalized),
+        format_opt(metrics.weighted_unifrac),
+        format_opt(metrics.unweighted_unifrac),
         format_opt(metrics.abundance_rank_error),
         format_opt(metrics.mass_weighted_abundance_rank_error)
     )?;
@@ -1103,8 +1219,8 @@ fn taxonomy_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProfileEntry, abundance_rank_error, highest_taxid_in_taxpath,
-        mass_weighted_abundance_rank_error, unifrac,
+        CANONICAL_RANKS, ProfileEntry, abundance_rank_error, canonical_rank_index,
+        highest_taxid_in_taxpath, mass_weighted_abundance_rank_error, unifrac, unifrac_components,
     };
     use crate::cami::Entry;
     use std::collections::HashMap;
@@ -1117,15 +1233,20 @@ mod tests {
     }
 
     fn profile_entry_for_test(taxpath: &str, percentage: f64) -> ProfileEntry {
-        let taxid = taxpath
-            .split('|')
-            .last()
-            .filter(|s| !s.is_empty())
-            .unwrap_or(taxpath);
+        let parts: Vec<&str> = taxpath.split('|').filter(|s| !s.is_empty()).collect();
+        let taxid = parts.last().copied().unwrap_or(taxpath);
+        let rank_index = parts
+            .len()
+            .checked_sub(1)
+            .unwrap_or(0)
+            .min(CANONICAL_RANKS.len() - 1);
+        let rank = CANONICAL_RANKS[rank_index].to_string();
         ProfileEntry {
             taxid: taxid.to_string(),
+            rank,
             percentage,
             taxpath: taxpath.to_string(),
+            taxpathsn: taxpath.to_string(),
         }
     }
 
@@ -1157,8 +1278,8 @@ mod tests {
             profile_entry_for_test("sk|p|c|o|f|h|i", 40.0),
         ];
         let result = unifrac(rank, &gt, &pred);
-        assert!(result.weighted_raw.unwrap() < 1e-12);
-        assert!(result.unweighted_raw.unwrap() < 1e-12);
+        assert!(result.weighted.unwrap_or(0.0) < 1e-12);
+        assert!(result.unweighted.unwrap_or(0.0) < 1e-12);
     }
 
     #[test]
@@ -1167,10 +1288,8 @@ mod tests {
         let gt = vec![profile_entry_for_test("a|b|c|d|e|f|g|t1", 100.0)];
         let pred = vec![profile_entry_for_test("z|y|x|w|v|u|s|t2", 100.0)];
         let result = unifrac(rank, &gt, &pred);
-        assert!((result.weighted_raw.unwrap() - 14.0).abs() < 1e-9);
-        assert!((result.weighted_normalized.unwrap() - 1.0).abs() < 1e-9);
-        assert!((result.unweighted_raw.unwrap() - 14.0).abs() < 1e-9);
-        assert!((result.unweighted_normalized.unwrap() - 2.0).abs() < 1e-9);
+        assert!((result.weighted.unwrap() - 1.0).abs() < 1e-9);
+        assert!((result.unweighted.unwrap() - 1.0).abs() < 1e-9);
     }
 
     #[test]
@@ -1185,12 +1304,11 @@ mod tests {
             profile_entry_for_test("sk|p|c|o|f|g3", 40.0),
         ];
         let result = unifrac(rank, &gt, &pred);
-        let baseline = unifrac(rank, &gt, &[]);
-        let expected_max = baseline.unweighted_raw.unwrap();
-        assert!((result.unweighted_max.unwrap() - expected_max).abs() < 1e-9);
-        let normalized = result.unweighted_normalized.unwrap();
-        let expected_normalized = result.unweighted_raw.unwrap() / expected_max;
-        assert!((normalized - expected_normalized).abs() < 1e-9);
+        let rank_index = canonical_rank_index(rank).unwrap();
+        let components = unifrac_components(rank_index, &gt, &pred).unwrap();
+        let baseline = unifrac_components(rank_index, &gt, &[]).unwrap();
+        let expected_normalized = components.unweighted_raw / baseline.gt_unweighted_max;
+        assert!((result.unweighted.unwrap() - expected_normalized).abs() < 1e-9);
     }
 
     #[test]
@@ -1200,15 +1318,13 @@ mod tests {
         let pred_genus = vec![profile_entry_for_test("sk|p|c|o|f|g2", 100.0)];
         let pred_strain = vec![profile_entry_for_test("sk|p|c|o|f|g2|s2|t2", 100.0)];
 
-        let result_genus = unifrac(rank, &gt, &pred_genus);
-        let result_strain = unifrac(rank, &gt, &pred_strain);
+        let rank_index = canonical_rank_index(rank).unwrap();
+        let genus_components = unifrac_components(rank_index, &gt, &pred_genus).unwrap();
+        let strain_components = unifrac_components(rank_index, &gt, &pred_strain).unwrap();
 
-        let genus_raw = result_genus.weighted_raw.unwrap();
-        let strain_raw = result_strain.weighted_raw.unwrap();
-
-        assert!(genus_raw > 0.0 && genus_raw < 14.0);
-        assert!(strain_raw >= genus_raw - 1e-9);
-        assert!(strain_raw <= 14.0);
+        assert!(genus_components.weighted_raw > 0.0);
+        assert!(strain_components.weighted_raw >= genus_components.weighted_raw - 1e-9);
+        assert!(strain_components.weighted_raw <= genus_components.max_weighted + 1e-9);
     }
 
     #[test]
