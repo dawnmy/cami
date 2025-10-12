@@ -3,6 +3,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
 
@@ -28,10 +29,8 @@ pub struct BenchmarkConfig {
 #[derive(Clone)]
 struct ProfileEntry {
     taxid: String,
-    rank: String,
     percentage: f64,
-    taxpath: String,
-    taxpathsn: String,
+    lineage: Arc<[Option<String>]>,
 }
 
 pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
@@ -240,6 +239,7 @@ fn build_profile_map(
     let mut map: HashMap<String, HashMap<String, Vec<ProfileEntry>>> = HashMap::new();
     let rank_filter: Option<BTreeSet<String>> = ranks.map(|r| r.iter().cloned().collect());
     let domain_lower = domain.map(|d| d.to_lowercase());
+    let mut lineage_cache: HashMap<String, Arc<[Option<String>]>> = HashMap::new();
 
     for sample in samples {
         let mut sample_map: HashMap<String, Vec<ProfileEntry>> = HashMap::new();
@@ -258,15 +258,20 @@ fn build_profile_map(
                 }
             }
             let rank_name = canonical_rank(&entry.rank).unwrap_or_else(|_| entry.rank.clone());
+            let cache_key = lineage_cache_key(entry, &rank_name);
+            let lineage = lineage_cache
+                .entry(cache_key)
+                .or_insert_with(|| {
+                    Arc::from(compute_lineage(entry, &rank_name, taxonomy).into_boxed_slice())
+                })
+                .clone();
             sample_map
                 .entry(rank_name.clone())
                 .or_default()
                 .push(ProfileEntry {
                     taxid: entry.taxid.clone(),
-                    rank: rank_name,
                     percentage: entry.percentage,
-                    taxpath: entry.taxpath.clone(),
-                    taxpathsn: entry.taxpathsn.clone(),
+                    lineage,
                 });
         }
 
@@ -646,8 +651,7 @@ fn unifrac_components(
             if !mass.is_finite() || mass <= 0.0 {
                 continue;
             }
-            let path = parse_taxpath(entry);
-            tree.add_mass(&path, rank_index, mass, true);
+            tree.add_mass(entry.lineage.as_ref(), rank_index, mass, true);
         }
     }
 
@@ -657,8 +661,7 @@ fn unifrac_components(
             if !mass.is_finite() || mass <= 0.0 {
                 continue;
             }
-            let path = parse_taxpath(entry);
-            tree.add_mass(&path, rank_index, mass, false);
+            tree.add_mass(entry.lineage.as_ref(), rank_index, mass, false);
         }
     }
 
@@ -698,24 +701,48 @@ fn canonical_rank_index(rank: &str) -> Option<usize> {
     }
 }
 
-fn parse_taxpath(entry: &ProfileEntry) -> Vec<Option<String>> {
-    let entry_rank_index = canonical_rank_index(&entry.rank)
+fn lineage_cache_key(entry: &Entry, canonical_rank: &str) -> String {
+    let base = if let Some(tid) = parse_taxid(&entry.taxid) {
+        format!("taxid:{}", tid)
+    } else if !entry.taxpath.trim().is_empty() {
+        entry.taxpath.trim().to_string()
+    } else if !entry.taxpathsn.trim().is_empty() {
+        entry.taxpathsn.trim().to_string()
+    } else {
+        entry.taxid.trim().to_string()
+    };
+
+    format!("{}|{}", canonical_rank, base)
+}
+
+fn compute_lineage(
+    entry: &Entry,
+    canonical_rank: &str,
+    taxonomy: Option<&Taxonomy>,
+) -> Vec<Option<String>> {
+    let entry_rank_index = canonical_rank_index(canonical_rank)
         .unwrap_or_else(|| CANONICAL_RANKS.len().saturating_sub(1));
     let mut result = vec![None; CANONICAL_RANKS.len()];
 
-    let mut normalized = taxid_lineage(entry);
+    if let Some(taxonomy) = taxonomy {
+        if let Some(taxid) = parse_taxid(&entry.taxid).or_else(|| highest_taxid_in_taxpath(entry)) {
+            fill_lineage_from_taxonomy(&mut result, entry_rank_index, taxonomy, taxid);
+        }
+    }
+
+    let mut normalized = taxid_lineage_from_path(&entry.taxpath, &entry.taxid);
 
     if normalized.is_empty() {
         normalized = split_taxpath(&entry.taxpathsn)
-            .iter()
-            .filter_map(|part| normalize_taxpath_component(part))
+            .into_iter()
+            .filter_map(|part| normalize_taxpath_component(&part))
             .collect();
     }
 
     if normalized.is_empty() {
         normalized = split_taxpath(&entry.taxpath)
-            .iter()
-            .filter_map(|part| normalize_taxpath_component(part))
+            .into_iter()
+            .filter_map(|part| normalize_taxpath_component(&part))
             .collect();
     }
 
@@ -733,16 +760,54 @@ fn parse_taxpath(entry: &ProfileEntry) -> Vec<Option<String>> {
 
     let offset = entry_rank_index + 1 - normalized.len();
     for (idx, name) in normalized.into_iter().enumerate() {
-        result[offset + idx] = Some(name);
+        let target = offset + idx;
+        if result[target].is_none() {
+            result[target] = Some(name);
+        }
     }
 
     if result[0].is_none() {
-        if let Some(superkingdom) = infer_superkingdom(entry) {
+        if let Some(superkingdom) = infer_superkingdom(entry, taxonomy) {
             result[0] = Some(superkingdom);
         }
     }
 
     result
+}
+
+fn fill_lineage_from_taxonomy(
+    result: &mut [Option<String>],
+    entry_rank_index: usize,
+    taxonomy: &Taxonomy,
+    taxid: u32,
+) {
+    let lineage = taxonomy.lineage(taxid);
+    for (tid, rank, _) in lineage.iter() {
+        if let Some(idx) = canonical_rank_index(rank) {
+            if idx <= entry_rank_index {
+                result[idx] = Some(format!("taxid:{}", tid));
+            }
+        }
+    }
+}
+
+fn taxid_lineage_from_path(taxpath: &str, taxid: &str) -> Vec<String> {
+    let mut lineage: Vec<String> = split_taxpath(taxpath)
+        .into_iter()
+        .filter_map(|component| normalize_taxid_component(&component))
+        .collect();
+
+    if let Some(taxid_component) = normalize_taxid_component(taxid) {
+        if lineage
+            .last()
+            .map(|last| last != &taxid_component)
+            .unwrap_or(true)
+        {
+            lineage.push(taxid_component);
+        }
+    }
+
+    lineage
 }
 
 fn split_taxpath(path: &str) -> Vec<String> {
@@ -800,7 +865,15 @@ fn normalize_taxid_component(raw: &str) -> Option<String> {
         .map(|id| format!("taxid:{}", id))
 }
 
-fn infer_superkingdom(entry: &ProfileEntry) -> Option<String> {
+fn infer_superkingdom(entry: &Entry, taxonomy: Option<&Taxonomy>) -> Option<String> {
+    if let Some(taxonomy) = taxonomy {
+        if let Some(tid) = parse_taxid(&entry.taxid).or_else(|| highest_taxid_in_taxpath(entry)) {
+            if let Some(name) = taxonomy.domain_of(tid) {
+                return Some(name);
+            }
+        }
+    }
+
     for component in split_taxpath(&entry.taxpathsn) {
         if let Some(label) =
             normalize_taxpath_component(&component).and_then(|value| detect_superkingdom(&value))
@@ -1251,11 +1324,12 @@ fn taxonomy_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        CANONICAL_RANKS, ProfileEntry, abundance_rank_error, canonical_rank_index,
+        CANONICAL_RANKS, ProfileEntry, abundance_rank_error, canonical_rank_index, compute_lineage,
         highest_taxid_in_taxpath, mass_weighted_abundance_rank_error, unifrac, unifrac_components,
     };
     use crate::cami::Entry;
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     fn map(entries: &[(&str, f64)]) -> HashMap<String, f64> {
         entries
@@ -1273,12 +1347,18 @@ mod tests {
             .unwrap_or(0)
             .min(CANONICAL_RANKS.len() - 1);
         let rank = CANONICAL_RANKS[rank_index].to_string();
-        ProfileEntry {
+        let entry = Entry {
             taxid: taxid.to_string(),
-            rank,
-            percentage,
+            rank: rank.clone(),
             taxpath: taxpath.to_string(),
             taxpathsn: taxpath.to_string(),
+            percentage,
+        };
+        let lineage = Arc::from(compute_lineage(&entry, &rank, None).into_boxed_slice());
+        ProfileEntry {
+            taxid: entry.taxid.clone(),
+            percentage,
+            lineage,
         }
     }
 
@@ -1317,19 +1397,29 @@ mod tests {
     #[test]
     fn unifrac_uses_taxid_lineage_even_when_names_differ() {
         let rank = "species";
-        let gt = vec![ProfileEntry {
+        let gt_entry = Entry {
             taxid: "123".to_string(),
             rank: rank.to_string(),
-            percentage: 100.0,
             taxpath: "1|2|123".to_string(),
             taxpathsn: "Root|Clade|Species alpha".to_string(),
-        }];
-        let pred = vec![ProfileEntry {
+            percentage: 100.0,
+        };
+        let pred_entry = Entry {
             taxid: "123".to_string(),
             rank: rank.to_string(),
-            percentage: 100.0,
             taxpath: "1|2|123".to_string(),
             taxpathsn: "Root|Synonym|Species beta".to_string(),
+            percentage: 100.0,
+        };
+        let gt = vec![ProfileEntry {
+            taxid: gt_entry.taxid.clone(),
+            percentage: gt_entry.percentage,
+            lineage: Arc::from(compute_lineage(&gt_entry, rank, None).into_boxed_slice()),
+        }];
+        let pred = vec![ProfileEntry {
+            taxid: pred_entry.taxid.clone(),
+            percentage: pred_entry.percentage,
+            lineage: Arc::from(compute_lineage(&pred_entry, rank, None).into_boxed_slice()),
         }];
         let result = unifrac(rank, &gt, &pred);
         assert!(result.weighted.unwrap_or(1.0) < 1e-12);
