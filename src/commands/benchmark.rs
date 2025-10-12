@@ -563,7 +563,7 @@ pub struct UniFracResult {
 struct UnifracComponents {
     weighted_raw: f64,
     unweighted_raw: f64,
-    gt_unweighted_max: f64,
+    unweighted_max: f64,
     max_weighted: f64,
 }
 
@@ -604,8 +604,8 @@ fn unifrac(
             } else {
                 None
             };
-            let unweighted = if components.gt_unweighted_max > MASS_EPSILON {
-                Some((components.unweighted_raw / components.gt_unweighted_max).clamp(0.0, 1.0))
+            let unweighted = if components.unweighted_max > MASS_EPSILON {
+                Some((components.unweighted_raw / components.unweighted_max).clamp(0.0, 1.0))
             } else {
                 None
             };
@@ -662,7 +662,7 @@ fn unifrac_components(
         }
     }
 
-    let (weighted_raw, unweighted_raw, gt_unweighted_max) = tree.compute_edge_flows();
+    let (weighted_raw, unweighted_raw, unweighted_max) = tree.compute_edge_flows();
     let path_length = BRANCH_LENGTHS
         .iter()
         .take(rank_index + 1)
@@ -678,7 +678,7 @@ fn unifrac_components(
     Some(UnifracComponents {
         weighted_raw: clamped_weighted,
         unweighted_raw: unweighted_raw.max(0.0),
-        gt_unweighted_max,
+        unweighted_max,
         max_weighted,
     })
 }
@@ -703,23 +703,26 @@ fn parse_taxpath(entry: &ProfileEntry) -> Vec<Option<String>> {
         .unwrap_or_else(|| CANONICAL_RANKS.len().saturating_sub(1));
     let mut result = vec![None; CANONICAL_RANKS.len()];
 
-    let mut parts = if !entry.taxpathsn.trim().is_empty() {
-        split_taxpath(&entry.taxpathsn)
-    } else {
-        split_taxpath(&entry.taxpath)
-    };
-
-    if parts.is_empty() {
-        parts = split_taxpath(&entry.taxpath);
-    }
-
-    let mut normalized: Vec<String> = parts
-        .iter()
-        .filter_map(|part| normalize_taxpath_component(part))
-        .collect();
+    let mut normalized = taxid_lineage(entry);
 
     if normalized.is_empty() {
-        if let Some(value) = normalize_taxpath_component(&entry.taxid) {
+        normalized = split_taxpath(&entry.taxpathsn)
+            .iter()
+            .filter_map(|part| normalize_taxpath_component(part))
+            .collect();
+    }
+
+    if normalized.is_empty() {
+        normalized = split_taxpath(&entry.taxpath)
+            .iter()
+            .filter_map(|part| normalize_taxpath_component(part))
+            .collect();
+    }
+
+    if normalized.is_empty() {
+        if let Some(value) = normalize_taxid_component(&entry.taxid) {
+            normalized.push(value);
+        } else if let Some(value) = normalize_taxpath_component(&entry.taxid) {
             normalized.push(value);
         }
     }
@@ -750,6 +753,25 @@ fn split_taxpath(path: &str) -> Vec<String> {
         .collect()
 }
 
+fn taxid_lineage(entry: &ProfileEntry) -> Vec<String> {
+    let mut lineage: Vec<String> = split_taxpath(&entry.taxpath)
+        .into_iter()
+        .filter_map(|component| normalize_taxid_component(&component))
+        .collect();
+
+    if let Some(taxid_component) = normalize_taxid_component(&entry.taxid) {
+        if lineage
+            .last()
+            .map(|last| last != &taxid_component)
+            .unwrap_or(true)
+        {
+            lineage.push(taxid_component);
+        }
+    }
+
+    lineage
+}
+
 fn normalize_taxpath_component(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -766,6 +788,16 @@ fn normalize_taxpath_component(raw: &str) -> Option<String> {
         return Some("Viruses".to_string());
     }
     Some(trimmed.to_string())
+}
+
+fn normalize_taxid_component(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    parse_taxid(trimmed)
+        .filter(|id| *id != 0)
+        .map(|id| format!("taxid:{}", id))
 }
 
 fn infer_superkingdom(entry: &ProfileEntry) -> Option<String> {
@@ -920,7 +952,7 @@ impl TaxTree {
 
         let mut weighted = 0.0;
         let mut unweighted = 0.0;
-        let mut gt_unweighted = 0.0;
+        let mut union_unweighted = 0.0;
 
         for node_id in 1..self.nodes.len() {
             let branch_length = self.nodes[node_id].branch_length;
@@ -944,12 +976,12 @@ impl TaxTree {
             if presence_diff > 0.0 {
                 unweighted += branch_length * presence_diff;
             }
-            if gt_present {
-                gt_unweighted += branch_length;
+            if gt_present || pred_present {
+                union_unweighted += branch_length;
             }
         }
 
-        (weighted, unweighted, gt_unweighted)
+        (weighted, unweighted, union_unweighted)
     }
 }
 
@@ -1283,6 +1315,28 @@ mod tests {
     }
 
     #[test]
+    fn unifrac_uses_taxid_lineage_even_when_names_differ() {
+        let rank = "species";
+        let gt = vec![ProfileEntry {
+            taxid: "123".to_string(),
+            rank: rank.to_string(),
+            percentage: 100.0,
+            taxpath: "1|2|123".to_string(),
+            taxpathsn: "Root|Clade|Species alpha".to_string(),
+        }];
+        let pred = vec![ProfileEntry {
+            taxid: "123".to_string(),
+            rank: rank.to_string(),
+            percentage: 100.0,
+            taxpath: "1|2|123".to_string(),
+            taxpathsn: "Root|Synonym|Species beta".to_string(),
+        }];
+        let result = unifrac(rank, &gt, &pred);
+        assert!(result.weighted.unwrap_or(1.0) < 1e-12);
+        assert!(result.unweighted.unwrap_or(1.0) < 1e-12);
+    }
+
+    #[test]
     fn unifrac_strain_singletons_on_opposite_branches_reach_max() {
         let rank = "strain";
         let gt = vec![profile_entry_for_test("a|b|c|d|e|f|g|t1", 100.0)];
@@ -1306,8 +1360,13 @@ mod tests {
         let result = unifrac(rank, &gt, &pred);
         let rank_index = canonical_rank_index(rank).unwrap();
         let components = unifrac_components(rank_index, &gt, &pred).unwrap();
-        let baseline = unifrac_components(rank_index, &gt, &[]).unwrap();
-        let expected_normalized = components.unweighted_raw / baseline.gt_unweighted_max;
+        let gt_baseline = unifrac_components(rank_index, &gt, &[]).unwrap();
+        let pred_baseline = unifrac_components(rank_index, &[], &pred).unwrap();
+        let shared = vec![profile_entry_for_test("sk|p|c|o|f|g1", 60.0)];
+        let shared_components = unifrac_components(rank_index, &shared, &shared).unwrap();
+        let union_length = gt_baseline.unweighted_max + pred_baseline.unweighted_max
+            - shared_components.unweighted_max;
+        let expected_normalized = components.unweighted_raw / union_length;
         assert!((result.unweighted.unwrap() - expected_normalized).abs() < 1e-9);
     }
 
