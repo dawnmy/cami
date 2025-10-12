@@ -69,6 +69,12 @@ enum Commands {
         )]
         predictions: Vec<PathBuf>,
         #[arg(
+            short = 'u',
+            long = "update-taxonomy",
+            help = "Refresh taxonomy fields from the local NCBI taxdump when benchmarking."
+        )]
+        update_taxonomy: bool,
+        #[arg(
             short = 'l',
             long = "labels",
             value_name = "LABELS",
@@ -277,6 +283,7 @@ fn main() -> Result<()> {
         Commands::Benchmark {
             ground_truth,
             predictions,
+            update_taxonomy,
             labels,
             all_filter,
             ground_filter,
@@ -291,6 +298,7 @@ fn main() -> Result<()> {
             let cfg = BenchmarkRunConfig {
                 ground_truth: ground_truth.clone(),
                 predictions: predictions.clone(),
+                update_taxonomy: *update_taxonomy,
                 labels: label_vec,
                 all_filter: all_filter.clone(),
                 ground_filter: ground_filter.clone(),
