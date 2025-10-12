@@ -16,6 +16,7 @@ use crate::taxonomy::{Taxonomy, ensure_taxdump, parse_taxid};
 pub struct BenchmarkConfig {
     pub ground_truth: PathBuf,
     pub predictions: Vec<PathBuf>,
+    pub update_taxonomy: bool,
     pub labels: Vec<String>,
     pub all_filter: Option<String>,
     pub ground_filter: Option<String>,
@@ -61,7 +62,8 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
         .transpose()
         .context("parsing predicted-profile filter expression")?;
 
-    let needs_taxdump = cfg.by_domain
+    let needs_taxdump = cfg.update_taxonomy
+        || cfg.by_domain
         || all_expr
             .as_ref()
             .is_some_and(|expr| expr_needs_taxdump(expr))
@@ -72,7 +74,7 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
             .as_ref()
             .is_some_and(|expr| expr_needs_taxdump(expr));
 
-    let taxonomy = if needs_taxdump {
+    let mut taxonomy = if needs_taxdump {
         let dir = taxonomy_dir();
         ensure_taxdump(&dir).with_context(|| format!("ensuring taxdump in {}", dir.display()))?;
         Some(Taxonomy::load(&dir)?)
@@ -83,6 +85,18 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
     let mut gt_samples = cami::parse_cami(&cfg.ground_truth)?;
     if gt_samples.is_empty() {
         bail!("ground truth profile has no samples");
+    }
+
+    let mut taxonomy_cache: HashMap<u32, LineageInfo> = HashMap::new();
+
+    if cfg.update_taxonomy || samples_need_superkingdom(&gt_samples) {
+        let taxonomy_ref = ensure_taxonomy_loaded(&mut taxonomy)?;
+        update_samples_taxonomy(
+            &mut gt_samples,
+            taxonomy_ref,
+            cfg.update_taxonomy,
+            &mut taxonomy_cache,
+        );
     }
 
     if let Some(expr) = all_expr.as_ref() {
@@ -155,6 +169,17 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
 
         for (pred_path, label) in cfg.predictions.iter().zip(labels.iter()) {
             let mut pred_samples = cami::parse_cami(pred_path)?;
+
+            if cfg.update_taxonomy || samples_need_superkingdom(&pred_samples) {
+                let taxonomy_ref = ensure_taxonomy_loaded(&mut taxonomy)?;
+                update_samples_taxonomy(
+                    &mut pred_samples,
+                    taxonomy_ref,
+                    cfg.update_taxonomy,
+                    &mut taxonomy_cache,
+                );
+            }
+
             if let Some(expr) = all_expr.as_ref() {
                 pred_samples = apply_filter(&pred_samples, expr, taxonomy.as_ref());
             }
@@ -818,23 +843,244 @@ fn split_taxpath(path: &str) -> Vec<String> {
         .collect()
 }
 
-fn taxid_lineage(entry: &ProfileEntry) -> Vec<String> {
-    let mut lineage: Vec<String> = split_taxpath(&entry.taxpath)
-        .into_iter()
-        .filter_map(|component| normalize_taxid_component(&component))
-        .collect();
+fn ensure_taxonomy_loaded<'a>(taxonomy: &'a mut Option<Taxonomy>) -> Result<&'a Taxonomy> {
+    if taxonomy.is_none() {
+        let dir = taxonomy_dir();
+        ensure_taxdump(&dir).with_context(|| format!("ensuring taxdump in {}", dir.display()))?;
+        *taxonomy = Some(Taxonomy::load(&dir)?);
+    }
+    Ok(taxonomy.as_ref().unwrap())
+}
 
-    if let Some(taxid_component) = normalize_taxid_component(&entry.taxid) {
-        if lineage
-            .last()
-            .map(|last| last != &taxid_component)
-            .unwrap_or(true)
+fn samples_need_superkingdom(samples: &[Sample]) -> bool {
+    samples
+        .iter()
+        .flat_map(|sample| sample.entries.iter())
+        .any(|entry| entry_missing_superkingdom(entry))
+}
+
+fn entry_missing_superkingdom(entry: &Entry) -> bool {
+    let mut id_parts = entry
+        .taxpath
+        .split('|')
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty());
+    let mut name_parts = entry
+        .taxpathsn
+        .split('|')
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty());
+
+    let id_present = id_parts
+        .next()
+        .and_then(|value| parse_taxid(value))
+        .map(|tid| matches!(tid, 2 | 2157 | 2759 | 10239))
+        .unwrap_or(false);
+
+    let name_present = name_parts
+        .next()
+        .map(|value| {
+            let lower = value.to_lowercase();
+            lower.contains("bacteria")
+                || lower.contains("archaea")
+                || lower.contains("eukary")
+                || lower.contains("viruses")
+        })
+        .unwrap_or(false);
+
+    !(id_present || name_present)
+}
+
+fn update_samples_taxonomy(
+    samples: &mut [Sample],
+    taxonomy: &Taxonomy,
+    update_paths: bool,
+    cache: &mut HashMap<u32, LineageInfo>,
+) {
+    for sample in samples.iter_mut() {
+        for entry in sample.entries.iter_mut() {
+            let Some(taxid) = parse_taxid(&entry.taxid) else {
+                continue;
+            };
+            let info = cache
+                .entry(taxid)
+                .or_insert_with(|| canonical_lineage(taxonomy, taxid))
+                .clone();
+            if update_paths {
+                apply_full_update(entry, &info);
+            } else {
+                ensure_superkingdom_only(entry, &info);
+            }
+        }
+    }
+}
+
+fn apply_full_update(entry: &mut Entry, info: &LineageInfo) {
+    if let Some(rank_name) = info.rank_name.as_ref() {
+        entry.rank = rank_name.clone();
+    } else if let Ok(canonical) = canonical_rank(&entry.rank) {
+        entry.rank = canonical;
+    }
+
+    let target_idx = info
+        .rank_index
+        .or_else(|| canonical_rank_index(&entry.rank))
+        .unwrap_or(info.deepest_index);
+
+    let (taxpath, taxpathsn) = info.path_up_to(target_idx);
+    if !taxpath.is_empty() {
+        entry.taxpath = taxpath;
+    }
+    if !taxpathsn.is_empty() {
+        entry.taxpathsn = taxpathsn;
+    }
+}
+
+fn ensure_superkingdom_only(entry: &mut Entry, info: &LineageInfo) {
+    if let Some((taxid, name)) = info.superkingdom() {
+        let mut ids = split_taxpath(&entry.taxpath);
+        if !ids.first().map(|first| first == &taxid).unwrap_or(false) {
+            ids.insert(0, taxid.clone());
+        }
+
+        let mut names = split_taxpath(&entry.taxpathsn);
+        if !names
+            .first()
+            .map(|first| first.eq_ignore_ascii_case(&name))
+            .unwrap_or(false)
         {
-            lineage.push(taxid_component);
+            names.insert(0, name.clone());
+        }
+
+        entry.taxpath = ids.join("|");
+        entry.taxpathsn = names.join("|");
+    }
+}
+
+#[derive(Clone)]
+struct LineageInfo {
+    canonical: Arc<[Option<(String, String)>]>,
+    rank_index: Option<usize>,
+    rank_name: Option<String>,
+    deepest_index: usize,
+}
+
+impl LineageInfo {
+    fn path_up_to(&self, upto: usize) -> (String, String) {
+        if self.canonical.is_empty() {
+            return (String::new(), String::new());
+        }
+        let limit = upto.min(self.canonical.len().saturating_sub(1));
+        let mut ids = Vec::new();
+        let mut names = Vec::new();
+        for idx in 0..=limit {
+            if let Some((tid, name)) = self.canonical[idx].as_ref() {
+                ids.push(tid.clone());
+                names.push(name.clone());
+            }
+        }
+        (ids.join("|"), names.join("|"))
+    }
+
+    fn superkingdom(&self) -> Option<(String, String)> {
+        self.canonical.get(0).and_then(|entry| {
+            entry
+                .as_ref()
+                .map(|(tid, name)| (tid.clone(), name.clone()))
+        })
+    }
+}
+
+fn canonical_lineage(taxonomy: &Taxonomy, taxid: u32) -> LineageInfo {
+    let lineage = taxonomy.lineage(taxid);
+    let mut canonical: Vec<Option<(String, String)>> = vec![None; CANONICAL_RANKS.len()];
+    let mut rank_index: Option<usize> = None;
+    let mut rank_name: Option<String> = None;
+
+    for (tid, rank, name) in lineage.iter() {
+        let canonical_rank_name = canonical_rank(rank).unwrap_or_else(|_| rank.clone());
+        if let Some(idx) = canonical_rank_index(&canonical_rank_name) {
+            canonical[idx] = Some((tid.to_string(), name.clone()));
+            if *tid == taxid {
+                rank_index = Some(idx);
+                rank_name = Some(CANONICAL_RANKS[idx].to_string());
+            }
+        } else if *tid == taxid {
+            rank_name = Some(canonical_rank_name.clone());
         }
     }
 
-    lineage
+    let taxid_str = taxid.to_string();
+    let tip_name = taxonomy.name_of(taxid).unwrap_or_else(|| taxid_str.clone());
+
+    if let Some(idx) = rank_index {
+        let needs_update = canonical[idx]
+            .as_ref()
+            .map(|(tid, _)| tid != &taxid_str)
+            .unwrap_or(true);
+        if needs_update {
+            canonical[idx] = Some((taxid_str.clone(), tip_name.clone()));
+        }
+    } else {
+        let fallback_idx = canonical
+            .iter()
+            .rposition(|v| v.is_some())
+            .map(|idx| (idx + 1).min(CANONICAL_RANKS.len() - 1))
+            .unwrap_or(CANONICAL_RANKS.len() - 1);
+        canonical[fallback_idx] = Some((taxid_str.clone(), tip_name.clone()));
+        rank_index = Some(fallback_idx);
+        rank_name = Some(CANONICAL_RANKS[fallback_idx].to_string());
+    }
+
+    let domain_name = taxonomy.domain_of(taxid);
+    if canonical[0].is_none() {
+        if let Some(domain) = domain_name.clone() {
+            if let Some((tid, _, name)) = lineage
+                .iter()
+                .find(|(_, _, n)| n.eq_ignore_ascii_case(&domain))
+            {
+                canonical[0] = Some((tid.to_string(), name.clone()))
+            } else if domain.eq_ignore_ascii_case("Viruses") {
+                canonical[0] = Some(("10239".to_string(), domain));
+            } else {
+                canonical[0] = Some((taxid_str.clone(), domain));
+            }
+        }
+    } else if let Some((tid, name)) = canonical[0].as_mut() {
+        if name.eq_ignore_ascii_case("acellular root")
+            || name.eq_ignore_ascii_case("acellular organisms")
+            || name.eq_ignore_ascii_case("cellular organisms")
+        {
+            if let Some(domain) = domain_name.clone() {
+                if !domain.eq_ignore_ascii_case(name) {
+                    if let Some((domain_tid, _, _)) = lineage
+                        .iter()
+                        .find(|(_, _, n)| n.eq_ignore_ascii_case(&domain))
+                    {
+                        *tid = domain_tid.to_string();
+                        *name = domain;
+                    } else if domain.eq_ignore_ascii_case("Viruses") {
+                        *tid = "10239".to_string();
+                        *name = domain;
+                    } else {
+                        *name = domain;
+                    }
+                }
+            }
+        }
+    }
+
+    let deepest_index = canonical
+        .iter()
+        .rposition(|v| v.is_some())
+        .unwrap_or(rank_index.unwrap_or(0));
+
+    LineageInfo {
+        canonical: Arc::from(canonical.into_boxed_slice()),
+        rank_index,
+        rank_name,
+        deepest_index,
+    }
 }
 
 fn normalize_taxpath_component(raw: &str) -> Option<String> {
@@ -1324,10 +1570,12 @@ fn taxonomy_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        CANONICAL_RANKS, ProfileEntry, abundance_rank_error, canonical_rank_index, compute_lineage,
-        highest_taxid_in_taxpath, mass_weighted_abundance_rank_error, unifrac, unifrac_components,
+        CANONICAL_RANKS, LineageInfo, ProfileEntry, abundance_rank_error, canonical_rank_index,
+        compute_lineage, ensure_superkingdom_only, entry_missing_superkingdom,
+        highest_taxid_in_taxpath, mass_weighted_abundance_rank_error, samples_need_superkingdom,
+        unifrac, unifrac_components,
     };
-    use crate::cami::Entry;
+    use crate::cami::{Entry, Sample};
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -1336,6 +1584,83 @@ mod tests {
             .iter()
             .map(|(name, value)| ((*name).to_string(), *value))
             .collect()
+    }
+
+    #[test]
+    fn entry_missing_superkingdom_detects_empty_paths() {
+        let missing = Entry {
+            taxid: "1".to_string(),
+            rank: "superkingdom".to_string(),
+            taxpath: "".to_string(),
+            taxpathsn: "".to_string(),
+            percentage: 100.0,
+        };
+        assert!(entry_missing_superkingdom(&missing));
+
+        let present = Entry {
+            taxid: "2".to_string(),
+            rank: "superkingdom".to_string(),
+            taxpath: "2".to_string(),
+            taxpathsn: "Bacteria".to_string(),
+            percentage: 100.0,
+        };
+        assert!(!entry_missing_superkingdom(&present));
+    }
+
+    #[test]
+    fn ensure_superkingdom_only_sets_prefix() {
+        let mut entry = Entry {
+            taxid: "123".to_string(),
+            rank: "phylum".to_string(),
+            taxpath: "123".to_string(),
+            taxpathsn: "Firmicutes".to_string(),
+            percentage: 10.0,
+        };
+        let mut canonical = vec![None; CANONICAL_RANKS.len()];
+        canonical[0] = Some(("2".to_string(), "Bacteria".to_string()));
+        canonical[1] = Some(("123".to_string(), "Firmicutes".to_string()));
+        let info = LineageInfo {
+            canonical: Arc::from(canonical.into_boxed_slice()),
+            rank_index: Some(1),
+            rank_name: Some("phylum".to_string()),
+            deepest_index: 1,
+        };
+
+        ensure_superkingdom_only(&mut entry, &info);
+        assert_eq!(entry.taxpath, "2|123");
+        assert_eq!(entry.taxpathsn, "Bacteria|Firmicutes");
+    }
+
+    #[test]
+    fn samples_need_superkingdom_flags_entries() {
+        let sample_missing = Sample {
+            id: "s1".to_string(),
+            version: None,
+            ranks: Vec::new(),
+            entries: vec![Entry {
+                taxid: "1".to_string(),
+                rank: "superkingdom".to_string(),
+                taxpath: "".to_string(),
+                taxpathsn: "".to_string(),
+                percentage: 100.0,
+            }],
+        };
+        let sample_ok = Sample {
+            id: "s2".to_string(),
+            version: None,
+            ranks: Vec::new(),
+            entries: vec![Entry {
+                taxid: "2".to_string(),
+                rank: "superkingdom".to_string(),
+                taxpath: "2".to_string(),
+                taxpathsn: "Bacteria".to_string(),
+                percentage: 100.0,
+            }],
+        };
+
+        assert!(samples_need_superkingdom(&[sample_missing.clone()]));
+        assert!(!samples_need_superkingdom(&[sample_ok.clone()]));
+        assert!(samples_need_superkingdom(&[sample_ok, sample_missing]));
     }
 
     fn profile_entry_for_test(taxpath: &str, percentage: f64) -> ProfileEntry {
