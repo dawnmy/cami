@@ -818,6 +818,25 @@ fn split_taxpath(path: &str) -> Vec<String> {
         .collect()
 }
 
+fn taxid_lineage(entry: &ProfileEntry) -> Vec<String> {
+    let mut lineage: Vec<String> = split_taxpath(&entry.taxpath)
+        .into_iter()
+        .filter_map(|component| normalize_taxid_component(&component))
+        .collect();
+
+    if let Some(taxid_component) = normalize_taxid_component(&entry.taxid) {
+        if lineage
+            .last()
+            .map(|last| last != &taxid_component)
+            .unwrap_or(true)
+        {
+            lineage.push(taxid_component);
+        }
+    }
+
+    lineage
+}
+
 fn normalize_taxpath_component(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
