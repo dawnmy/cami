@@ -569,6 +569,7 @@ const CANONICAL_RANKS: [&str; 7] = [
 ];
 
 const BRANCH_LENGTHS: [f64; CANONICAL_RANKS.len()] = [1.0; CANONICAL_RANKS.len()];
+const MASS_EPSILON: f64 = 1e-12;
 
 fn branch_length_for_level(level: usize) -> f64 {
     BRANCH_LENGTHS
@@ -627,23 +628,36 @@ fn unifrac(
 
     let (weighted_raw, unweighted_raw, gt_unweighted_max) = tree.compute_edge_flows();
 
-    let path_length = BRANCH_LENGTHS.iter().copied().sum::<f64>();
+    let path_length = BRANCH_LENGTHS
+        .iter()
+        .take(rank_index + 1)
+        .copied()
+        .sum::<f64>();
     let max_weighted = 2.0 * path_length;
-    let weighted_raw = weighted_raw.max(0.0).min(max_weighted);
+    let weighted_raw = weighted_raw.max(0.0);
+    let weighted_raw = if max_weighted > 0.0 {
+        weighted_raw.min(max_weighted)
+    } else {
+        weighted_raw
+    };
     let weighted_raw_opt = Some(weighted_raw);
-    let weighted_normalized = Some((weighted_raw / max_weighted).clamp(0.0, 1.0));
+    let weighted_normalized = if max_weighted > 0.0 {
+        Some((weighted_raw / max_weighted).clamp(0.0, 1.0))
+    } else {
+        None
+    };
 
     let unweighted_raw = unweighted_raw.max(0.0);
     let unweighted_raw_opt = Some(unweighted_raw);
 
-    let unweighted_max = if gt_unweighted_max > 0.0 {
+    let unweighted_max = if gt_unweighted_max > MASS_EPSILON {
         Some(gt_unweighted_max)
     } else {
         None
     };
 
     let unweighted_normalized = match (unweighted_raw_opt, unweighted_max) {
-        (Some(raw), Some(max)) if max > 0.0 => Some(raw / max),
+        (Some(raw), Some(max)) if max > 0.0 => Some((raw / max).clamp(0.0, 1.0)),
         _ => None,
     };
 
@@ -775,70 +789,48 @@ impl TaxTree {
     }
 
     fn compute_edge_flows(&self) -> (f64, f64, f64) {
-        let weighted = self.flow_cost(
-            self.nodes
-                .iter()
-                .map(|node| node.gt_mass - node.pred_mass)
-                .collect(),
-        );
-
-        let mut gt_present = vec![false; self.nodes.len()];
-        let mut pred_present = vec![false; self.nodes.len()];
-        for (idx, node) in self.nodes.iter().enumerate() {
-            if node.gt_mass > 0.0 {
-                gt_present[idx] = true;
-            }
-            if node.pred_mass > 0.0 {
-                pred_present[idx] = true;
-            }
-        }
+        let mut gt_subtree: Vec<f64> = self.nodes.iter().map(|node| node.gt_mass).collect();
+        let mut pred_subtree: Vec<f64> = self.nodes.iter().map(|node| node.pred_mass).collect();
 
         for node_id in (1..self.nodes.len()).rev() {
             if let Some(parent) = self.nodes[node_id].parent {
-                if gt_present[node_id] {
-                    gt_present[parent] = true;
-                }
-                if pred_present[node_id] {
-                    pred_present[parent] = true;
-                }
+                gt_subtree[parent] += gt_subtree[node_id];
+                pred_subtree[parent] += pred_subtree[node_id];
             }
         }
 
-        let gt_flags: Vec<f64> = gt_present
-            .iter()
-            .map(|present| if *present { 1.0 } else { 0.0 })
-            .collect();
-        let pred_flags: Vec<f64> = pred_present
-            .iter()
-            .map(|present| if *present { 1.0 } else { 0.0 })
-            .collect();
+        let mut weighted = 0.0;
+        let mut unweighted = 0.0;
+        let mut gt_unweighted = 0.0;
 
-        let gt_unweighted = self.flow_cost(gt_flags.clone());
-        let unweighted = self.flow_cost(
-            gt_flags
-                .iter()
-                .zip(pred_flags.iter())
-                .map(|(g, p)| g - p)
-                .collect(),
-        );
+        for node_id in 1..self.nodes.len() {
+            let branch_length = self.nodes[node_id].branch_length;
+            if branch_length <= 0.0 {
+                continue;
+            }
+
+            let gt_mass = gt_subtree[node_id];
+            let pred_mass = pred_subtree[node_id];
+            let diff = (gt_mass - pred_mass).abs();
+            if diff > MASS_EPSILON {
+                weighted += branch_length * diff;
+            }
+
+            let gt_present = gt_mass > MASS_EPSILON;
+            let pred_present = pred_mass > MASS_EPSILON;
+            let presence_diff = match (gt_present, pred_present) {
+                (true, false) | (false, true) => 1.0,
+                _ => 0.0,
+            };
+            if presence_diff > 0.0 {
+                unweighted += branch_length * presence_diff;
+            }
+            if gt_present {
+                gt_unweighted += branch_length;
+            }
+        }
 
         (weighted, unweighted, gt_unweighted)
-    }
-
-    fn flow_cost(&self, mut diff: Vec<f64>) -> f64 {
-        let mut cost = 0.0;
-        for node_id in (1..self.nodes.len()).rev() {
-            let node = &self.nodes[node_id];
-            let flow = diff[node_id];
-            if flow != 0.0 {
-                cost += node.branch_length * flow.abs();
-                if let Some(parent) = node.parent {
-                    diff[parent] += flow;
-                }
-                diff[node_id] = 0.0;
-            }
-        }
-        cost
     }
 }
 
