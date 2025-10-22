@@ -16,16 +16,44 @@ pub fn run(cfg: &PreviewConfig) -> Result<()> {
         if let Some(version) = &sample.version {
             writeln!(out, "@Version:{}", version)?;
         }
-        if !sample.ranks.is_empty() {
-            writeln!(out, "@Ranks:{}", sample.ranks.join("|"))?;
+        let rank_tokens = sample.header_rank_tokens();
+        if !rank_tokens.is_empty() {
+            writeln!(out, "@Ranks:{}", rank_tokens.join("|"))?;
         }
-        writeln!(out, "@@TAXID\tRANK\tTAXPATH\tTAXPATHSN\tPERCENTAGE")?;
-        for entry in sample.entries.iter().take(cfg.n) {
+        let extended = sample.is_modern_format()
+            || sample
+                .entries
+                .iter()
+                .any(|e| e.cami_genome_id.is_some() || e.cami_otu.is_some() || e.hosts.is_some());
+        if extended {
             writeln!(
                 out,
-                "{}\t{}\t{}\t{}\t{}",
-                entry.taxid, entry.rank, entry.taxpath, entry.taxpathsn, entry.percentage
+                "@@TAXID\tRANK\tTAXPATH\tTAXPATHSN\tPERCENTAGE\t_CAMI_genomeID\t_CAMI_OTU\tHOSTS"
             )?;
+        } else {
+            writeln!(out, "@@TAXID\tRANK\tTAXPATH\tTAXPATHSN\tPERCENTAGE")?;
+        }
+        for entry in sample.entries.iter().take(cfg.n) {
+            if extended {
+                writeln!(
+                    out,
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    entry.taxid,
+                    entry.rank,
+                    entry.taxpath,
+                    entry.taxpathsn,
+                    entry.percentage,
+                    entry.cami_genome_id.as_deref().unwrap_or(""),
+                    entry.cami_otu.as_deref().unwrap_or(""),
+                    entry.hosts.as_deref().unwrap_or("")
+                )?;
+            } else {
+                writeln!(
+                    out,
+                    "{}\t{}\t{}\t{}\t{}",
+                    entry.taxid, entry.rank, entry.taxpath, entry.taxpathsn, entry.percentage
+                )?;
+            }
         }
     }
     Ok(())
