@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail, ensure};
 use crate::cami;
 use crate::cami::{Entry, Sample};
 use crate::expression::{apply_filter, expr_needs_taxdump, parse_expression};
-use crate::taxonomy::{Taxonomy, ensure_taxdump, parse_taxid};
+use crate::taxonomy::{Taxonomy, default_taxdump_dir, ensure_taxdump, parse_taxid};
 
 #[derive(Clone)]
 pub struct BenchmarkConfig {
@@ -25,6 +25,7 @@ pub struct BenchmarkConfig {
     pub by_domain: bool,
     pub output: PathBuf,
     pub ranks: Option<Vec<String>>,
+    pub dmp_dir: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -74,10 +75,12 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
             .as_ref()
             .is_some_and(|expr| expr_needs_taxdump(expr));
 
+    let tax_dir = cfg.dmp_dir.clone().unwrap_or_else(default_taxdump_dir);
+
     let mut taxonomy = if needs_taxdump {
-        let dir = taxonomy_dir();
-        ensure_taxdump(&dir).with_context(|| format!("ensuring taxdump in {}", dir.display()))?;
-        Some(Taxonomy::load(&dir)?)
+        ensure_taxdump(&tax_dir)
+            .with_context(|| format!("ensuring taxdump in {}", tax_dir.display()))?;
+        Some(Taxonomy::load(&tax_dir)?)
     } else {
         None
     };
@@ -90,7 +93,7 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
     let mut taxonomy_cache: HashMap<u32, LineageInfo> = HashMap::new();
 
     if cfg.update_taxonomy || samples_need_superkingdom(&gt_samples) {
-        let taxonomy_ref = ensure_taxonomy_loaded(&mut taxonomy)?;
+        let taxonomy_ref = ensure_taxonomy_loaded(&mut taxonomy, &tax_dir)?;
         update_samples_taxonomy(
             &mut gt_samples,
             taxonomy_ref,
@@ -171,7 +174,7 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
             let mut pred_samples = cami::parse_cami(pred_path)?;
 
             if cfg.update_taxonomy || samples_need_superkingdom(&pred_samples) {
-                let taxonomy_ref = ensure_taxonomy_loaded(&mut taxonomy)?;
+                let taxonomy_ref = ensure_taxonomy_loaded(&mut taxonomy, &tax_dir)?;
                 update_samples_taxonomy(
                     &mut pred_samples,
                     taxonomy_ref,
@@ -843,11 +846,13 @@ fn split_taxpath(path: &str) -> Vec<String> {
         .collect()
 }
 
-fn ensure_taxonomy_loaded<'a>(taxonomy: &'a mut Option<Taxonomy>) -> Result<&'a Taxonomy> {
+fn ensure_taxonomy_loaded<'a>(
+    taxonomy: &'a mut Option<Taxonomy>,
+    dir: &Path,
+) -> Result<&'a Taxonomy> {
     if taxonomy.is_none() {
-        let dir = taxonomy_dir();
-        ensure_taxdump(&dir).with_context(|| format!("ensuring taxdump in {}", dir.display()))?;
-        *taxonomy = Some(Taxonomy::load(&dir)?);
+        ensure_taxdump(dir).with_context(|| format!("ensuring taxdump in {}", dir.display()))?;
+        *taxonomy = Some(Taxonomy::load(dir)?);
     }
     Ok(taxonomy.as_ref().unwrap())
 }
@@ -1561,12 +1566,6 @@ fn format_float(value: f64) -> String {
     format!("{:.5}", value)
 }
 
-fn taxonomy_dir() -> PathBuf {
-    dirs::home_dir()
-        .map(|p| p.join(".cami"))
-        .unwrap_or_else(|| PathBuf::from(".cami"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1594,6 +1593,9 @@ mod tests {
             taxpath: "".to_string(),
             taxpathsn: "".to_string(),
             percentage: 100.0,
+            cami_genome_id: None,
+            cami_otu: None,
+            hosts: None,
         };
         assert!(entry_missing_superkingdom(&missing));
 
@@ -1603,6 +1605,9 @@ mod tests {
             taxpath: "2".to_string(),
             taxpathsn: "Bacteria".to_string(),
             percentage: 100.0,
+            cami_genome_id: None,
+            cami_otu: None,
+            hosts: None,
         };
         assert!(!entry_missing_superkingdom(&present));
     }
@@ -1615,6 +1620,9 @@ mod tests {
             taxpath: "123".to_string(),
             taxpathsn: "Firmicutes".to_string(),
             percentage: 10.0,
+            cami_genome_id: None,
+            cami_otu: None,
+            hosts: None,
         };
         let mut canonical = vec![None; CANONICAL_RANKS.len()];
         canonical[0] = Some(("2".to_string(), "Bacteria".to_string()));
@@ -1637,24 +1645,34 @@ mod tests {
             id: "s1".to_string(),
             version: None,
             ranks: Vec::new(),
+            rank_groups: Vec::new(),
+            rank_aliases: HashMap::new(),
             entries: vec![Entry {
                 taxid: "1".to_string(),
                 rank: "superkingdom".to_string(),
                 taxpath: "".to_string(),
                 taxpathsn: "".to_string(),
                 percentage: 100.0,
+                cami_genome_id: None,
+                cami_otu: None,
+                hosts: None,
             }],
         };
         let sample_ok = Sample {
             id: "s2".to_string(),
             version: None,
             ranks: Vec::new(),
+            rank_groups: Vec::new(),
+            rank_aliases: HashMap::new(),
             entries: vec![Entry {
                 taxid: "2".to_string(),
                 rank: "superkingdom".to_string(),
                 taxpath: "2".to_string(),
                 taxpathsn: "Bacteria".to_string(),
                 percentage: 100.0,
+                cami_genome_id: None,
+                cami_otu: None,
+                hosts: None,
             }],
         };
 
@@ -1678,6 +1696,9 @@ mod tests {
             taxpath: taxpath.to_string(),
             taxpathsn: taxpath.to_string(),
             percentage,
+            cami_genome_id: None,
+            cami_otu: None,
+            hosts: None,
         };
         let lineage = Arc::from(compute_lineage(&entry, &rank, None).into_boxed_slice());
         ProfileEntry {
@@ -1728,6 +1749,9 @@ mod tests {
             taxpath: "1|2|123".to_string(),
             taxpathsn: "Root|Clade|Species alpha".to_string(),
             percentage: 100.0,
+            cami_genome_id: None,
+            cami_otu: None,
+            hosts: None,
         };
         let pred_entry = Entry {
             taxid: "123".to_string(),
@@ -1735,6 +1759,9 @@ mod tests {
             taxpath: "1|2|123".to_string(),
             taxpathsn: "Root|Synonym|Species beta".to_string(),
             percentage: 100.0,
+            cami_genome_id: None,
+            cami_otu: None,
+            hosts: None,
         };
         let gt = vec![ProfileEntry {
             taxid: gt_entry.taxid.clone(),
@@ -1873,6 +1900,9 @@ mod tests {
             taxpath: "2731618|2731619|3424659|1198980|2956277".to_string(),
             taxpathsn: "".to_string(),
             percentage: 1.0,
+            cami_genome_id: None,
+            cami_otu: None,
+            hosts: None,
         };
 
         assert_eq!(highest_taxid_in_taxpath(&entry), Some(2_731_618));
@@ -1886,6 +1916,9 @@ mod tests {
             taxpath: "||abc||".to_string(),
             taxpathsn: "".to_string(),
             percentage: 1.0,
+            cami_genome_id: None,
+            cami_otu: None,
+            hosts: None,
         };
 
         assert_eq!(highest_taxid_in_taxpath(&entry), Some(12_345));

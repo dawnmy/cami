@@ -2,6 +2,15 @@ use crate::cami::{Entry, Sample};
 use crate::taxonomy::{Taxonomy, parse_taxid};
 use std::collections::{BTreeSet, HashMap};
 
+#[derive(Clone)]
+struct RankDetail {
+    rank: String,
+    taxid: String,
+    name: String,
+}
+
+type RankMap = HashMap<usize, RankDetail>;
+
 pub fn renormalize(samples: &mut [Sample]) {
     for sample in samples.iter_mut() {
         let mut by_rank: HashMap<String, Vec<usize>> = HashMap::new();
@@ -77,7 +86,7 @@ pub fn fill_up_to(
         }
 
         let mut sums: HashMap<(usize, String), f64> = HashMap::new();
-        let mut cache: HashMap<String, HashMap<String, (String, String)>> = HashMap::new();
+        let mut cache: HashMap<String, RankMap> = HashMap::new();
 
         for entry in &sample.entries {
             let Some(entry_rank_idx) = sample.rank_index(&entry.rank) else {
@@ -97,18 +106,18 @@ pub fn fill_up_to(
                 if rank_idx == entry_rank_idx {
                     continue;
                 }
-                let rank = &sample.ranks[rank_idx];
-                if let Some((tid, _name)) = rank_map.get(rank) {
-                    if existing_by_key.contains_key(&(rank_idx, tid.clone())) {
+                if let Some(detail) = rank_map.get(&rank_idx) {
+                    if existing_by_key.contains_key(&(rank_idx, detail.taxid.clone())) {
                         continue;
                     }
-                    *sums.entry((rank_idx, tid.clone())).or_insert(0.0) += entry.percentage;
+                    *sums.entry((rank_idx, detail.taxid.clone())).or_insert(0.0) +=
+                        entry.percentage;
                 }
             }
         }
 
         let mut new_entries: Vec<Entry> = Vec::new();
-        for (idx, rank) in sample.ranks.iter().enumerate() {
+        for idx in 0..sample.ranks.len() {
             if idx < start_idx || idx > end_idx {
                 continue;
             }
@@ -141,19 +150,32 @@ pub fn fill_up_to(
                     }
                     continue;
                 };
-                if !rank_map.contains_key(rank) {
+                if !rank_map.contains_key(&idx) {
                     if let Some(entry) = existing_entry {
                         new_entries.push(entry.clone());
                     }
                     continue;
                 }
-                let (taxpath, taxpathsn) = build_paths(sample, &rank_map, rank);
+                let detail = rank_map.get(&idx).unwrap();
+                let (taxpath, taxpathsn) = build_paths(sample, &rank_map, idx);
+                let (cami_genome_id, cami_otu, hosts) = existing_entry
+                    .map(|e| {
+                        (
+                            e.cami_genome_id.clone(),
+                            e.cami_otu.clone(),
+                            e.hosts.clone(),
+                        )
+                    })
+                    .unwrap_or((None, None, None));
                 new_entries.push(Entry {
                     taxid: taxid.clone(),
-                    rank: rank.clone(),
+                    rank: detail.rank.clone(),
                     taxpath,
                     taxpathsn,
                     percentage,
+                    cami_genome_id,
+                    cami_otu,
+                    hosts,
                 });
             }
         }
@@ -180,13 +202,13 @@ pub fn fill_up_default(samples: &mut [Sample], from_rank: Option<&str>, taxonomy
 fn select_base_rank(sample: &Sample, from_rank: Option<&str>) -> Option<usize> {
     if let Some(rank) = from_rank {
         if let Some(idx) = sample.rank_index(rank) {
-            if has_entries_at(sample, &sample.ranks[idx]) {
+            if has_entries_at(sample, idx) {
                 return Some(idx);
             }
         }
     }
     if let Some(idx) = sample.rank_index("species") {
-        if has_entries_at(sample, &sample.ranks[idx]) {
+        if has_entries_at(sample, idx) {
             return Some(idx);
         }
     }
@@ -195,35 +217,42 @@ fn select_base_rank(sample: &Sample, from_rank: Option<&str>) -> Option<usize> {
         .iter()
         .enumerate()
         .rev()
-        .find(|(_, rank)| has_entries_at(sample, rank))
+        .find(|(idx, _)| has_entries_at(sample, *idx))
         .map(|(idx, _)| idx)
 }
 
-fn has_entries_at(sample: &Sample, rank: &str) -> bool {
-    sample.entries.iter().any(|e| e.rank == rank)
+fn has_entries_at(sample: &Sample, idx: usize) -> bool {
+    sample
+        .entries
+        .iter()
+        .any(|e| sample.rank_index(&e.rank) == Some(idx))
 }
 
 fn rank_map_for<'a, F>(
     sample: &Sample,
     taxonomy: &Taxonomy,
     taxid: &str,
-    cache: &'a mut HashMap<String, HashMap<String, (String, String)>>,
+    cache: &'a mut HashMap<String, RankMap>,
     mut fallback: F,
-) -> Option<&'a HashMap<String, (String, String)>>
+) -> Option<&'a RankMap>
 where
-    F: FnMut() -> Option<HashMap<String, (String, String)>>,
+    F: FnMut() -> Option<RankMap>,
 {
     if !cache.contains_key(taxid) {
         let mut map = build_rank_map(sample, taxonomy, taxid).unwrap_or_default();
-        let needs_fallback =
-            map.is_empty() || sample.ranks.iter().any(|rank| map.get(rank).is_none());
+        let needs_fallback = map.is_empty()
+            || sample
+                .ranks
+                .iter()
+                .enumerate()
+                .any(|(idx, _)| map.get(&idx).is_none());
         if needs_fallback {
             if let Some(fallback_map) = fallback() {
                 if map.is_empty() {
                     map = fallback_map;
                 } else {
-                    for (rank, value) in fallback_map {
-                        map.entry(rank).or_insert(value);
+                    for (idx, value) in fallback_map {
+                        map.entry(idx).or_insert(value);
                     }
                 }
             }
@@ -234,55 +263,61 @@ where
     if map.is_empty() { None } else { Some(map) }
 }
 
-fn build_rank_map(
-    sample: &Sample,
-    taxonomy: &Taxonomy,
-    taxid: &str,
-) -> Option<HashMap<String, (String, String)>> {
+fn build_rank_map(sample: &Sample, taxonomy: &Taxonomy, taxid: &str) -> Option<RankMap> {
     let tid = parse_taxid(taxid)?;
     let lineage = taxonomy.lineage(tid);
-    let mut map = HashMap::new();
+    let mut map: RankMap = HashMap::new();
     for (tid_u32, rank, name) in lineage.iter() {
-        if sample.ranks.iter().any(|r| r == rank) {
-            map.insert(rank.clone(), (tid_u32.to_string(), name.clone()));
+        let mut effective_rank = rank.clone();
+        if sample.rank_index(&effective_rank).is_none() && rank.eq_ignore_ascii_case("no rank") {
+            if sample.rank_index("strain").is_some() {
+                effective_rank = "strain".to_string();
+            }
+        }
+        if let Some(idx) = sample.rank_index(&effective_rank) {
+            map.entry(idx).or_insert(RankDetail {
+                rank: effective_rank,
+                taxid: tid_u32.to_string(),
+                name: name.clone(),
+            });
         }
     }
     if map.is_empty() { None } else { Some(map) }
 }
 
-fn fallback_rank_map(entry: &Entry, sample: &Sample) -> Option<HashMap<String, (String, String)>> {
+fn fallback_rank_map(entry: &Entry, sample: &Sample) -> Option<RankMap> {
     let ids: Vec<&str> = entry.taxpath.split('|').collect();
     let names: Vec<&str> = entry.taxpathsn.split('|').collect();
     if ids.is_empty() || names.is_empty() {
         return None;
     }
-    let mut map = HashMap::new();
+    let mut map: RankMap = HashMap::new();
     let upto = ids.len().min(names.len()).min(sample.ranks.len());
     for idx in 0..upto {
-        let rank = &sample.ranks[idx];
         let taxid = ids[idx].trim();
         let name = names[idx].trim();
         if !taxid.is_empty() {
-            map.insert(rank.clone(), (taxid.to_string(), name.to_string()));
+            map.insert(
+                idx,
+                RankDetail {
+                    rank: sample.ranks[idx].clone(),
+                    taxid: taxid.to_string(),
+                    name: name.to_string(),
+                },
+            );
         }
     }
     if map.is_empty() { None } else { Some(map) }
 }
 
-fn build_paths(
-    sample: &Sample,
-    rank_map: &HashMap<String, (String, String)>,
-    upto_rank: &str,
-) -> (String, String) {
+fn build_paths(sample: &Sample, rank_map: &RankMap, upto_idx: usize) -> (String, String) {
     let mut taxids = Vec::new();
     let mut names = Vec::new();
-    for rank in &sample.ranks {
-        if let Some((tid, name)) = rank_map.get(rank) {
-            taxids.push(tid.clone());
-            names.push(name.clone());
-        }
-        if rank == upto_rank {
-            break;
+    let limit = upto_idx.min(sample.ranks.len().saturating_sub(1));
+    for idx in 0..=limit {
+        if let Some(detail) = rank_map.get(&idx) {
+            taxids.push(detail.taxid.clone());
+            names.push(detail.name.clone());
         }
     }
     (taxids.join("|"), names.join("|"))

@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use commands::{
     benchmark::{self as benchmark_cmd, BenchmarkConfig as BenchmarkRunConfig},
+    convert::{self as convert_cmd, ConvertConfig as ConvertRunConfig},
     fillup::{self as fillup_cmd, FillupConfig},
     filter::{self as filter_cmd, FilterConfig},
     list::{self as list_cmd, ListConfig},
@@ -127,6 +128,12 @@ enum Commands {
             help = "Comma-separated list of ranks to evaluate (mix short and full names)."
         )]
         ranks: Option<String>,
+        #[arg(
+            long = "dmp-dir",
+            value_name = "DIR",
+            help = "Directory containing nodes.dmp and names.dmp (defaults to ~/.cami)."
+        )]
+        dmp_dir: Option<PathBuf>,
     },
     #[command(
         about = "Filter CAMI profiling data with logical expressions",
@@ -175,6 +182,12 @@ enum Commands {
             help = "Input CAMI file (defaults to stdin)."
         )]
         input: Option<PathBuf>,
+        #[arg(
+            long = "dmp-dir",
+            value_name = "DIR",
+            help = "Directory containing nodes.dmp and names.dmp (defaults to ~/.cami)."
+        )]
+        dmp_dir: Option<PathBuf>,
     },
     #[command(
         about = "List samples and per-rank summaries",
@@ -245,6 +258,55 @@ enum Commands {
             help = "Rank to aggregate from when filling (defaults to species when available)."
         )]
         from_rank: Option<String>,
+        #[arg(
+            long = "dmp-dir",
+            value_name = "DIR",
+            help = "Directory containing nodes.dmp and names.dmp (defaults to ~/.cami)."
+        )]
+        dmp_dir: Option<PathBuf>,
+    },
+    #[command(
+        about = "Convert TSV profiling results into CAMI format",
+        long_about = "Read taxonomic abundances from a TSV file and produce a CAMI-formatted profile with ranks completed from the NCBI taxdump."
+    )]
+    Convert {
+        #[arg(
+            value_name = "INPUT",
+            index = 1,
+            help = "Input TSV file (defaults to stdin)."
+        )]
+        input: Option<PathBuf>,
+        #[arg(short, long, help = "Write output to a file instead of stdout.")]
+        output: Option<PathBuf>,
+        #[arg(
+            short = 'i',
+            long = "taxid-column",
+            value_name = "INDEX",
+            default_value_t = 1,
+            help = "1-based column index containing NCBI taxids."
+        )]
+        taxid_column: usize,
+        #[arg(
+            short = 'a',
+            long = "abundance-column",
+            value_name = "INDEX",
+            default_value_t = 2,
+            help = "1-based column index containing abundances."
+        )]
+        abundance_column: usize,
+        #[arg(
+            long = "sample-id",
+            value_name = "ID",
+            default_value = "sample",
+            help = "Sample ID to use in the generated CAMI profile."
+        )]
+        sample_id: String,
+        #[arg(
+            long = "dmp-dir",
+            value_name = "DIR",
+            help = "Directory containing nodes.dmp and names.dmp (defaults to ~/.cami)."
+        )]
+        dmp_dir: Option<PathBuf>,
     },
     #[command(
         about = "Sort taxa within each rank",
@@ -292,6 +354,7 @@ fn main() -> Result<()> {
             by_domain,
             output,
             ranks,
+            dmp_dir,
         } => {
             let label_vec = labels.as_ref().map(|s| split_labels(s)).unwrap_or_default();
             let rank_vec = ranks.as_ref().map(|s| split_ranks(s));
@@ -307,6 +370,7 @@ fn main() -> Result<()> {
                 by_domain: *by_domain,
                 output: output.clone(),
                 ranks: rank_vec,
+                dmp_dir: dmp_dir.clone(),
             };
             benchmark_cmd::run(&cfg)
         }
@@ -318,6 +382,7 @@ fn main() -> Result<()> {
             to_rank,
             renorm,
             input,
+            dmp_dir,
         } => {
             let cfg = FilterConfig {
                 expression,
@@ -327,6 +392,7 @@ fn main() -> Result<()> {
                 to_rank,
                 renorm: *renorm,
                 input: input.as_ref(),
+                dmp_dir: dmp_dir.as_ref(),
             };
             filter_cmd::run(&cfg)
         }
@@ -355,14 +421,34 @@ fn main() -> Result<()> {
             output,
             to_rank,
             from_rank,
+            dmp_dir,
         } => {
             let cfg = FillupConfig {
                 input: input.as_ref(),
                 output: output.as_ref(),
                 to_rank: to_rank.as_deref(),
                 from_rank: from_rank.as_deref(),
+                dmp_dir: dmp_dir.as_ref(),
             };
             fillup_cmd::run(&cfg)
+        }
+        Commands::Convert {
+            input,
+            output,
+            taxid_column,
+            abundance_column,
+            sample_id,
+            dmp_dir,
+        } => {
+            let cfg = ConvertRunConfig {
+                input: input.as_ref(),
+                output: output.as_ref(),
+                taxid_column: *taxid_column,
+                abundance_column: *abundance_column,
+                sample_id,
+                dmp_dir: dmp_dir.as_ref(),
+            };
+            convert_cmd::run(&cfg)
         }
         Commands::Sort {
             abundance,
