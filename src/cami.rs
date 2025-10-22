@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 pub struct Sample {
     pub id: String,
     pub version: Option<String>,
+    pub taxonomy_tag: Option<String>,
     pub ranks: Vec<String>,
     pub rank_groups: Vec<Vec<String>>,
     pub rank_aliases: HashMap<String, usize>,
@@ -110,6 +111,7 @@ pub fn parse_cami_reader<R: BufRead>(reader: R) -> Result<Vec<Sample>> {
             current = Some(Sample {
                 id,
                 version: None,
+                taxonomy_tag: None,
                 ranks: Vec::new(),
                 rank_groups: Vec::new(),
                 rank_aliases: HashMap::new(),
@@ -120,6 +122,12 @@ pub fn parse_cami_reader<R: BufRead>(reader: R) -> Result<Vec<Sample>> {
         if line.starts_with("@Version:") {
             if let Some(s) = current.as_mut() {
                 s.version = Some(line[9..].trim().to_string());
+            }
+            continue;
+        }
+        if line.starts_with("@TaxonomyID:") {
+            if let Some(s) = current.as_mut() {
+                s.taxonomy_tag = Some(line[12..].trim().to_string());
             }
             continue;
         }
@@ -207,6 +215,9 @@ pub fn write_cami(samples: &[Sample], out: &mut dyn Write) -> Result<()> {
         let rank_tokens = s.header_rank_tokens();
         if !rank_tokens.is_empty() {
             writeln!(out, "@Ranks:{}", rank_tokens.join("|"))?;
+        }
+        if let Some(tag) = &s.taxonomy_tag {
+            writeln!(out, "@TaxonomyID: {}", tag)?;
         }
         let extended = s.is_modern_format()
             || s.entries

@@ -23,6 +23,7 @@ pub struct BenchmarkConfig {
     pub pred_filter: Option<String>,
     pub normalize: bool,
     pub by_domain: bool,
+    pub group_realms: bool,
     pub output: PathBuf,
     pub ranks: Option<Vec<String>>,
     pub dmp_dir: Option<PathBuf>,
@@ -65,6 +66,7 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
 
     let needs_taxdump = cfg.update_taxonomy
         || cfg.by_domain
+        || cfg.group_realms
         || all_expr
             .as_ref()
             .is_some_and(|expr| expr_needs_taxdump(expr))
@@ -99,6 +101,7 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
             taxonomy_ref,
             cfg.update_taxonomy,
             &mut taxonomy_cache,
+            cfg.group_realms,
         );
     }
 
@@ -165,6 +168,7 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
             cfg.normalize,
             domain.as_deref(),
             taxonomy.as_ref(),
+            cfg.group_realms,
         );
 
         let mut sample_ids: Vec<_> = gt_map.keys().cloned().collect();
@@ -180,6 +184,7 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
                     taxonomy_ref,
                     cfg.update_taxonomy,
                     &mut taxonomy_cache,
+                    cfg.group_realms,
                 );
             }
 
@@ -195,6 +200,7 @@ pub fn run(cfg: &BenchmarkConfig) -> Result<()> {
                 cfg.normalize,
                 domain.as_deref(),
                 taxonomy.as_ref(),
+                cfg.group_realms,
             );
 
             for sample_id in &sample_ids {
@@ -263,6 +269,7 @@ fn build_profile_map(
     normalize: bool,
     domain: Option<&str>,
     taxonomy: Option<&Taxonomy>,
+    group_realms: bool,
 ) -> HashMap<String, HashMap<String, Vec<ProfileEntry>>> {
     let mut map: HashMap<String, HashMap<String, Vec<ProfileEntry>>> = HashMap::new();
     let rank_filter: Option<BTreeSet<String>> = ranks.map(|r| r.iter().cloned().collect());
@@ -281,7 +288,7 @@ fn build_profile_map(
                 }
             }
             if let Some(domain) = &domain_lower {
-                if !entry_belongs_to_domain(entry, domain, taxonomy) {
+                if !entry_belongs_to_domain(entry, domain, taxonomy, group_realms) {
                     continue;
                 }
             }
@@ -290,7 +297,10 @@ fn build_profile_map(
             let lineage = lineage_cache
                 .entry(cache_key)
                 .or_insert_with(|| {
-                    Arc::from(compute_lineage(entry, &rank_name, taxonomy).into_boxed_slice())
+                    Arc::from(
+                        compute_lineage(entry, &rank_name, taxonomy, group_realms)
+                            .into_boxed_slice(),
+                    )
                 })
                 .clone();
             sample_map
@@ -322,32 +332,106 @@ fn build_profile_map(
     map
 }
 
-fn entry_belongs_to_domain(entry: &Entry, domain: &str, taxonomy: Option<&Taxonomy>) -> bool {
-    if entry.taxpathsn.split('|').any(|name| {
-        let trimmed = name.trim();
-        !trimmed.is_empty() && trimmed.eq_ignore_ascii_case(domain)
-    }) {
-        return true;
+fn entry_belongs_to_domain(
+    entry: &Entry,
+    domain: &str,
+    taxonomy: Option<&Taxonomy>,
+    group_realms: bool,
+) -> bool {
+    let Some(target) = canonical_domain_name(domain, group_realms) else {
+        return false;
+    };
+
+    entry_domain_candidates(entry, taxonomy, group_realms)
+        .into_iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(&target))
+}
+
+fn entry_domain_candidates(
+    entry: &Entry,
+    taxonomy: Option<&Taxonomy>,
+    group_realms: bool,
+) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+
+    let mut push_candidate = |value: String| {
+        if !candidates
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&value))
+        {
+            candidates.push(value);
+        }
+    };
+
+    for component in entry.taxpathsn.split('|') {
+        if let Some(name) = canonical_domain_name(component, group_realms) {
+            push_candidate(name);
+        }
+    }
+
+    if group_realms {
+        if entry.taxid.trim() == "10239" {
+            push_candidate("Viruses".to_string());
+        }
+        for component in split_taxpath(&entry.taxpath) {
+            if component.trim() == "10239" {
+                push_candidate("Viruses".to_string());
+            }
+        }
     }
 
     if let Some(tax) = taxonomy {
-        if let Some(tid) = highest_taxid_in_taxpath(entry) {
+        let mut visit_taxid = |tid: u32| {
             if let Some(name) = tax.domain_of(tid) {
-                if name.eq_ignore_ascii_case(domain) {
-                    return true;
+                if let Some(normalized) = canonical_domain_name(&name, group_realms) {
+                    push_candidate(normalized);
                 }
             }
+            if group_realms {
+                if let Some(realm) = tax.realm_of(tid) {
+                    if component_is_virus_realm(&realm) {
+                        push_candidate("Viruses".to_string());
+                    }
+                }
+            }
+        };
+
+        if let Some(tid) = highest_taxid_in_taxpath(entry) {
+            visit_taxid(tid);
         }
         if let Some(tid) = parse_taxid(&entry.taxid) {
-            if let Some(name) = tax.domain_of(tid) {
-                if name.eq_ignore_ascii_case(domain) {
-                    return true;
-                }
-            }
+            visit_taxid(tid);
         }
     }
 
-    false
+    candidates
+}
+
+fn canonical_domain_name(raw: &str, group_realms: bool) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("bacteria") {
+        Some("Bacteria".to_string())
+    } else if lower.contains("archaea") || lower.contains("archaeon") || lower.contains("archaeota")
+    {
+        Some("Archaea".to_string())
+    } else if lower.contains("eukary") {
+        Some("Eukarya".to_string())
+    } else if lower.contains("viruses") {
+        Some("Viruses".to_string())
+    } else if group_realms && component_is_virus_realm(trimmed) {
+        Some("Viruses".to_string())
+    } else {
+        None
+    }
+}
+
+fn component_is_virus_realm(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    lower.contains("viria") || lower.contains("virae") || lower.contains("viruses")
 }
 
 fn highest_taxid_in_taxpath(entry: &Entry) -> Option<u32> {
@@ -747,6 +831,7 @@ fn compute_lineage(
     entry: &Entry,
     canonical_rank: &str,
     taxonomy: Option<&Taxonomy>,
+    group_realms: bool,
 ) -> Vec<Option<String>> {
     let entry_rank_index = canonical_rank_index(canonical_rank)
         .unwrap_or_else(|| CANONICAL_RANKS.len().saturating_sub(1));
@@ -763,21 +848,21 @@ fn compute_lineage(
     if normalized.is_empty() {
         normalized = split_taxpath(&entry.taxpathsn)
             .into_iter()
-            .filter_map(|part| normalize_taxpath_component(&part))
+            .filter_map(|part| normalize_taxpath_component(&part, group_realms))
             .collect();
     }
 
     if normalized.is_empty() {
         normalized = split_taxpath(&entry.taxpath)
             .into_iter()
-            .filter_map(|part| normalize_taxpath_component(&part))
+            .filter_map(|part| normalize_taxpath_component(&part, group_realms))
             .collect();
     }
 
     if normalized.is_empty() {
         if let Some(value) = normalize_taxid_component(&entry.taxid) {
             normalized.push(value);
-        } else if let Some(value) = normalize_taxpath_component(&entry.taxid) {
+        } else if let Some(value) = normalize_taxpath_component(&entry.taxid, group_realms) {
             normalized.push(value);
         }
     }
@@ -795,7 +880,7 @@ fn compute_lineage(
     }
 
     if result[0].is_none() {
-        if let Some(superkingdom) = infer_superkingdom(entry, taxonomy) {
+        if let Some(superkingdom) = infer_superkingdom(entry, taxonomy, group_realms) {
             result[0] = Some(superkingdom);
         }
     }
@@ -901,6 +986,7 @@ fn update_samples_taxonomy(
     taxonomy: &Taxonomy,
     update_paths: bool,
     cache: &mut HashMap<u32, LineageInfo>,
+    group_realms: bool,
 ) {
     for sample in samples.iter_mut() {
         for entry in sample.entries.iter_mut() {
@@ -909,7 +995,7 @@ fn update_samples_taxonomy(
             };
             let info = cache
                 .entry(taxid)
-                .or_insert_with(|| canonical_lineage(taxonomy, taxid))
+                .or_insert_with(|| canonical_lineage(taxonomy, taxid, group_realms))
                 .clone();
             if update_paths {
                 apply_full_update(entry, &info);
@@ -996,7 +1082,7 @@ impl LineageInfo {
     }
 }
 
-fn canonical_lineage(taxonomy: &Taxonomy, taxid: u32) -> LineageInfo {
+fn canonical_lineage(taxonomy: &Taxonomy, taxid: u32, group_realms: bool) -> LineageInfo {
     let lineage = taxonomy.lineage(taxid);
     let mut canonical: Vec<Option<(String, String)>> = vec![None; CANONICAL_RANKS.len()];
     let mut rank_index: Option<usize> = None;
@@ -1037,7 +1123,19 @@ fn canonical_lineage(taxonomy: &Taxonomy, taxid: u32) -> LineageInfo {
         rank_name = Some(CANONICAL_RANKS[fallback_idx].to_string());
     }
 
-    let domain_name = taxonomy.domain_of(taxid);
+    let mut domain_name = taxonomy.domain_of(taxid);
+    let belongs_to_virus = group_realms
+        && lineage.iter().any(|(tid, rank, name)| {
+            *tid == 10239
+                || rank.eq_ignore_ascii_case("realm") && component_is_virus_realm(name)
+                || name.eq_ignore_ascii_case("viruses")
+        });
+
+    if belongs_to_virus {
+        canonical[0] = Some(("10239".to_string(), "Viruses".to_string()));
+        domain_name = Some("Viruses".to_string());
+    }
+
     if canonical[0].is_none() {
         if let Some(domain) = domain_name.clone() {
             if let Some((tid, _, name)) = lineage
@@ -1088,7 +1186,7 @@ fn canonical_lineage(taxonomy: &Taxonomy, taxid: u32) -> LineageInfo {
     }
 }
 
-fn normalize_taxpath_component(raw: &str) -> Option<String> {
+fn normalize_taxpath_component(raw: &str, group_realms: bool) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
@@ -1101,6 +1199,9 @@ fn normalize_taxpath_component(raw: &str) -> Option<String> {
         return None;
     }
     if lower.contains("viruses") && !lower.eq("viruses") {
+        return Some("Viruses".to_string());
+    }
+    if group_realms && component_is_virus_realm(trimmed) {
         return Some("Viruses".to_string());
     }
     Some(trimmed.to_string())
@@ -1116,33 +1217,47 @@ fn normalize_taxid_component(raw: &str) -> Option<String> {
         .map(|id| format!("taxid:{}", id))
 }
 
-fn infer_superkingdom(entry: &Entry, taxonomy: Option<&Taxonomy>) -> Option<String> {
+fn infer_superkingdom(
+    entry: &Entry,
+    taxonomy: Option<&Taxonomy>,
+    group_realms: bool,
+) -> Option<String> {
     if let Some(taxonomy) = taxonomy {
         if let Some(tid) = parse_taxid(&entry.taxid).or_else(|| highest_taxid_in_taxpath(entry)) {
+            if group_realms {
+                if let Some(realm) = taxonomy.realm_of(tid) {
+                    if component_is_virus_realm(&realm) {
+                        return Some("Viruses".to_string());
+                    }
+                }
+            }
             if let Some(name) = taxonomy.domain_of(tid) {
+                if let Some(normalized) = canonical_domain_name(&name, group_realms) {
+                    return Some(normalized);
+                }
                 return Some(name);
             }
         }
     }
 
     for component in split_taxpath(&entry.taxpathsn) {
-        if let Some(label) =
-            normalize_taxpath_component(&component).and_then(|value| detect_superkingdom(&value))
+        if let Some(label) = normalize_taxpath_component(&component, group_realms)
+            .and_then(|value| detect_superkingdom(&value, group_realms))
         {
             return Some(label);
         }
-        if let Some(label) = detect_superkingdom(&component) {
+        if let Some(label) = detect_superkingdom(&component, group_realms) {
             return Some(label);
         }
     }
 
     for component in split_taxpath(&entry.taxpath) {
-        if let Some(label) =
-            normalize_taxpath_component(&component).and_then(|value| detect_superkingdom(&value))
+        if let Some(label) = normalize_taxpath_component(&component, group_realms)
+            .and_then(|value| detect_superkingdom(&value, group_realms))
         {
             return Some(label);
         }
-        if let Some(label) = detect_superkingdom(&component) {
+        if let Some(label) = detect_superkingdom(&component, group_realms) {
             return Some(label);
         }
         if let Ok(taxid) = component.parse::<u32>() {
@@ -1152,42 +1267,27 @@ fn infer_superkingdom(entry: &Entry, taxonomy: Option<&Taxonomy>) -> Option<Stri
         }
     }
 
-    detect_superkingdom(&entry.taxid)
+    detect_superkingdom(&entry.taxid, group_realms)
 }
 
-fn detect_superkingdom(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let canonical = trimmed
+fn detect_superkingdom(raw: &str, group_realms: bool) -> Option<String> {
+    let trimmed = raw
+        .trim()
         .split("__")
         .last()
-        .unwrap_or(trimmed)
+        .unwrap_or(raw)
         .split(':')
         .last()
-        .unwrap_or(trimmed)
+        .unwrap_or(raw)
         .trim();
-    let lower = canonical.to_lowercase();
-    if lower.contains("viruses") {
-        Some("Viruses".to_string())
-    } else if lower.contains("bacteria") {
-        Some("Bacteria".to_string())
-    } else if lower.contains("archaea") || lower.contains("archaeota") || lower.contains("archaeon")
-    {
-        Some("Archaea".to_string())
-    } else if lower.contains("eukary") {
-        Some("Eukaryota".to_string())
-    } else {
-        None
-    }
+    canonical_domain_name(trimmed, group_realms)
 }
 
 fn superkingdom_from_taxid(taxid: u32) -> Option<&'static str> {
     match taxid {
         2 => Some("Bacteria"),
         2157 => Some("Archaea"),
-        2759 => Some("Eukaryota"),
+        2759 => Some("Eukarya"),
         10239 => Some("Viruses"),
         _ => None,
     }
@@ -1644,6 +1744,7 @@ mod tests {
         let sample_missing = Sample {
             id: "s1".to_string(),
             version: None,
+            taxonomy_tag: None,
             ranks: Vec::new(),
             rank_groups: Vec::new(),
             rank_aliases: HashMap::new(),
@@ -1661,6 +1762,7 @@ mod tests {
         let sample_ok = Sample {
             id: "s2".to_string(),
             version: None,
+            taxonomy_tag: None,
             ranks: Vec::new(),
             rank_groups: Vec::new(),
             rank_aliases: HashMap::new(),
@@ -1700,7 +1802,7 @@ mod tests {
             cami_otu: None,
             hosts: None,
         };
-        let lineage = Arc::from(compute_lineage(&entry, &rank, None).into_boxed_slice());
+        let lineage = Arc::from(compute_lineage(&entry, &rank, None, false).into_boxed_slice());
         ProfileEntry {
             taxid: entry.taxid.clone(),
             percentage,
@@ -1766,12 +1868,12 @@ mod tests {
         let gt = vec![ProfileEntry {
             taxid: gt_entry.taxid.clone(),
             percentage: gt_entry.percentage,
-            lineage: Arc::from(compute_lineage(&gt_entry, rank, None).into_boxed_slice()),
+            lineage: Arc::from(compute_lineage(&gt_entry, rank, None, false).into_boxed_slice()),
         }];
         let pred = vec![ProfileEntry {
             taxid: pred_entry.taxid.clone(),
             percentage: pred_entry.percentage,
-            lineage: Arc::from(compute_lineage(&pred_entry, rank, None).into_boxed_slice()),
+            lineage: Arc::from(compute_lineage(&pred_entry, rank, None, false).into_boxed_slice()),
         }];
         let result = unifrac(rank, &gt, &pred);
         assert!(result.weighted.unwrap_or(1.0) < 1e-12);

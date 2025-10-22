@@ -24,6 +24,7 @@ pub struct Taxonomy {
     ancestors: RwLock<HashMap<u32, Arc<[u32]>>>,
     lineages: RwLock<HashMap<u32, Arc<[LineageEntry]>>>,
     domains: RwLock<HashMap<u32, Option<String>>>,
+    realms: RwLock<HashMap<u32, Option<String>>>,
     is_modern: bool,
 }
 
@@ -61,6 +62,7 @@ impl Taxonomy {
             ancestors: RwLock::new(HashMap::new()),
             lineages: RwLock::new(HashMap::new()),
             domains: RwLock::new(HashMap::new()),
+            realms: RwLock::new(HashMap::new()),
             is_modern,
         })
     }
@@ -158,6 +160,25 @@ impl Taxonomy {
             .unwrap()
             .insert(taxid, final_result.clone());
         final_result
+    }
+
+    pub fn realm_of(&self, taxid: u32) -> Option<String> {
+        if let Some(cached) = self.realms.read().unwrap().get(&taxid) {
+            return cached.clone();
+        }
+
+        let lineage = self.lineage(taxid);
+        let result = lineage.iter().find_map(|(_, rank, name)| {
+            if rank.eq_ignore_ascii_case("realm") {
+                Some(name.clone())
+            } else {
+                None
+            }
+        });
+
+        self.realms.write().unwrap().insert(taxid, result.clone());
+
+        result
     }
 
     pub fn uses_modern_ranks(&self) -> bool {
@@ -283,6 +304,7 @@ mod tests {
             ancestors: RwLock::new(HashMap::new()),
             lineages: RwLock::new(HashMap::new()),
             domains: RwLock::new(HashMap::new()),
+            realms: RwLock::new(HashMap::new()),
             is_modern: true,
         };
 
