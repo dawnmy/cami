@@ -7,6 +7,9 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+const LEGACY_CAMI_VERSION: &str = "0.10.0";
+const MODERN_CAMI_VERSION: &str = "0.11.0";
+
 pub struct ConvertConfig<'a> {
     pub input: Option<&'a PathBuf>,
     pub output: Option<&'a PathBuf>,
@@ -14,6 +17,7 @@ pub struct ConvertConfig<'a> {
     pub abundance_column: usize,
     pub sample_id: &'a str,
     pub dmp_dir: Option<&'a PathBuf>,
+    pub taxonomy_tag: Option<&'a str>,
 }
 
 pub fn run(cfg: &ConvertConfig) -> Result<()> {
@@ -24,9 +28,15 @@ pub fn run(cfg: &ConvertConfig) -> Result<()> {
     let taxonomy = Taxonomy::load(&dir)?;
 
     let modern = taxonomy.uses_modern_ranks();
+    let version = if modern {
+        MODERN_CAMI_VERSION
+    } else {
+        LEGACY_CAMI_VERSION
+    };
     let mut sample = Sample {
         id: cfg.sample_id.to_string(),
-        version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        version: Some(version.to_string()),
+        taxonomy_tag: cfg.taxonomy_tag.map(|tag| tag.to_string()),
         ranks: Vec::new(),
         rank_groups: Vec::new(),
         rank_aliases: HashMap::new(),

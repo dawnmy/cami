@@ -115,6 +115,11 @@ enum Commands {
         )]
         by_domain: bool,
         #[arg(
+            long = "group-realms",
+            help = "Group viral realms under the Viruses superkingdom when scoring and filtering."
+        )]
+        group_realms: bool,
+        #[arg(
             short = 'o',
             long = "output",
             value_name = "DIR",
@@ -295,12 +300,20 @@ enum Commands {
         )]
         abundance_column: usize,
         #[arg(
+            short = 's',
             long = "sample-id",
             value_name = "ID",
             default_value = "sample",
             help = "Sample ID to use in the generated CAMI profile."
         )]
         sample_id: String,
+        #[arg(
+            short = 'T',
+            long = "taxonomy-tag",
+            value_name = "TAG",
+            help = "@TaxonomyID value describing the NCBI taxonomy snapshot (e.g. 2025-06-19)."
+        )]
+        taxonomy_tag: Option<String>,
         #[arg(
             long = "dmp-dir",
             value_name = "DIR",
@@ -352,6 +365,7 @@ fn main() -> Result<()> {
             pred_filter,
             normalize,
             by_domain,
+            group_realms,
             output,
             ranks,
             dmp_dir,
@@ -368,6 +382,7 @@ fn main() -> Result<()> {
                 pred_filter: pred_filter.clone(),
                 normalize: *normalize,
                 by_domain: *by_domain,
+                group_realms: *group_realms,
                 output: output.clone(),
                 ranks: rank_vec,
                 dmp_dir: dmp_dir.clone(),
@@ -438,6 +453,7 @@ fn main() -> Result<()> {
             taxid_column,
             abundance_column,
             sample_id,
+            taxonomy_tag,
             dmp_dir,
         } => {
             let cfg = ConvertRunConfig {
@@ -446,6 +462,7 @@ fn main() -> Result<()> {
                 taxid_column: *taxid_column,
                 abundance_column: *abundance_column,
                 sample_id,
+                taxonomy_tag: taxonomy_tag.as_deref(),
                 dmp_dir: dmp_dir.as_ref(),
             };
             convert_cmd::run(&cfg)
