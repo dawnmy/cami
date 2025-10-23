@@ -4,7 +4,7 @@ use reqwest::blocking::get;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use tar::Archive;
@@ -24,6 +24,8 @@ pub struct Taxonomy {
     ancestors: RwLock<HashMap<u32, Arc<[u32]>>>,
     lineages: RwLock<HashMap<u32, Arc<[LineageEntry]>>>,
     domains: RwLock<HashMap<u32, Option<String>>>,
+    realms: RwLock<HashMap<u32, Option<String>>>,
+    is_modern: bool,
 }
 
 impl Taxonomy {
@@ -47,12 +49,21 @@ impl Taxonomy {
             .join()
             .map_err(|_| anyhow!("failed to parse names.dmp"))??;
 
+        let is_modern = nodes.values().any(|node| {
+            matches!(
+                node.rank.to_ascii_lowercase().as_str(),
+                "acellular root" | "cellular root" | "realm"
+            )
+        });
+
         Ok(Self {
             nodes,
             names,
             ancestors: RwLock::new(HashMap::new()),
             lineages: RwLock::new(HashMap::new()),
             domains: RwLock::new(HashMap::new()),
+            realms: RwLock::new(HashMap::new()),
+            is_modern,
         })
     }
 
@@ -122,6 +133,10 @@ impl Taxonomy {
         self.names.get(&taxid).cloned()
     }
 
+    pub fn rank_of(&self, taxid: u32) -> Option<String> {
+        self.nodes.get(&taxid).map(|n| n.rank.clone())
+    }
+
     pub fn domain_of(&self, taxid: u32) -> Option<String> {
         if let Some(cached) = self.domains.read().unwrap().get(&taxid) {
             return cached.clone();
@@ -146,6 +161,29 @@ impl Taxonomy {
             .insert(taxid, final_result.clone());
         final_result
     }
+
+    pub fn realm_of(&self, taxid: u32) -> Option<String> {
+        if let Some(cached) = self.realms.read().unwrap().get(&taxid) {
+            return cached.clone();
+        }
+
+        let lineage = self.lineage(taxid);
+        let result = lineage.iter().find_map(|(_, rank, name)| {
+            if rank.eq_ignore_ascii_case("realm") {
+                Some(name.clone())
+            } else {
+                None
+            }
+        });
+
+        self.realms.write().unwrap().insert(taxid, result.clone());
+
+        result
+    }
+
+    pub fn uses_modern_ranks(&self) -> bool {
+        self.is_modern
+    }
 }
 
 pub fn ensure_taxdump(dir: &Path) -> Result<()> {
@@ -162,6 +200,12 @@ pub fn ensure_taxdump(dir: &Path) -> Result<()> {
     let mut ar = Archive::new(gz);
     ar.unpack(dir)?;
     Ok(())
+}
+
+pub fn default_taxdump_dir() -> PathBuf {
+    dirs::home_dir()
+        .map(|p| p.join(".cami"))
+        .unwrap_or_else(|| PathBuf::from(".cami"))
 }
 
 fn parse_nodes(path: &Path) -> Result<HashMap<u32, TaxNode>> {
@@ -260,6 +304,8 @@ mod tests {
             ancestors: RwLock::new(HashMap::new()),
             lineages: RwLock::new(HashMap::new()),
             domains: RwLock::new(HashMap::new()),
+            realms: RwLock::new(HashMap::new()),
+            is_modern: true,
         };
 
         assert_eq!(taxonomy.domain_of(10239), Some("Viruses".to_string()));

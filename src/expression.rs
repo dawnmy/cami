@@ -583,8 +583,10 @@ fn parse_rank_list(raw: &str) -> Vec<String> {
 pub fn validate_rank_selectors(expr: &Expr, samples: &[Sample]) -> Result<()> {
     let mut ranks = BTreeSet::new();
     for sample in samples {
-        for rank in &sample.ranks {
-            ranks.insert(rank.clone());
+        for group in &sample.rank_groups {
+            for rank in group {
+                ranks.insert(rank.clone());
+            }
         }
     }
 

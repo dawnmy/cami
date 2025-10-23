@@ -3,7 +3,7 @@ use crate::expression::{
     apply_filter, expr_needs_taxdump, parse_expression, validate_rank_selectors,
 };
 use crate::processing::{fill_up_to, renormalize};
-use crate::taxonomy::{Taxonomy, ensure_taxdump};
+use crate::taxonomy::{Taxonomy, default_taxdump_dir, ensure_taxdump};
 use anyhow::{Context, Result, anyhow};
 use std::path::PathBuf;
 
@@ -15,6 +15,7 @@ pub struct FilterConfig<'a> {
     pub to_rank: &'a str,
     pub renorm: bool,
     pub input: Option<&'a PathBuf>,
+    pub dmp_dir: Option<&'a PathBuf>,
 }
 
 pub fn run(cfg: &FilterConfig) -> Result<()> {
@@ -24,7 +25,7 @@ pub fn run(cfg: &FilterConfig) -> Result<()> {
     let needs_taxdump = expr_needs_taxdump(&expr) || cfg.fill_up;
 
     let taxonomy = if needs_taxdump {
-        let dir = taxonomy_dir();
+        let dir = cfg.dmp_dir.cloned().unwrap_or_else(default_taxdump_dir);
         ensure_taxdump(&dir).with_context(|| format!("ensuring taxdump in {}", dir.display()))?;
         Some(Taxonomy::load(&dir)?)
     } else {
@@ -46,10 +47,4 @@ pub fn run(cfg: &FilterConfig) -> Result<()> {
     let mut out = open_output(cfg.output)?;
     write_cami(&filtered, &mut *out)?;
     Ok(())
-}
-
-fn taxonomy_dir() -> PathBuf {
-    dirs::home_dir()
-        .map(|p| p.join(".cami"))
-        .unwrap_or_else(|| PathBuf::from(".cami"))
 }
