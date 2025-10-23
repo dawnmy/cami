@@ -217,7 +217,7 @@ pub fn write_cami(samples: &[Sample], out: &mut dyn Write) -> Result<()> {
             writeln!(out, "@Ranks:{}", rank_tokens.join("|"))?;
         }
         if let Some(tag) = &s.taxonomy_tag {
-            writeln!(out, "@TaxonomyID: {}", tag)?;
+            writeln!(out, "@TaxonomyID:{}", tag)?;
         }
         let extended = s.is_modern_format()
             || s.entries
