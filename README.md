@@ -99,6 +99,42 @@ Examples:
 
 When `--fill-up` is supplied, the command downloads the NCBI taxdump (stored under `~/.cami`) if necessary. Use `--from <rank>` to specify which rank to aggregate from when filling and `--to <rank>` to control how far up the lineage to build. Combine `--renorm` to ensure each rank sums to 100 after filtering and filling.
 
+### `cami convert`
+
+Turn a simple TSV of taxonomic abundances into a fully fledged CAMI profile. The command reads the taxid and abundance columns you specify, looks up missing lineage information from the local NCBI taxdump, and emits a single-sample CAMI table with rounded percentages and populated ranks.
+
+Basic usage:
+
+```bash
+cami convert results.tsv > sample.cami
+```
+
+If the first line of the TSV contains headers, the command automatically skips it as long as the taxid and abundance fields cannot be parsed as numbers.
+
+Key options:
+
+- `-i, --taxid-column <INDEX>` – 1-based column holding NCBI taxids. Defaults to `1`. Use this when the taxid column is not the first field (e.g., `-i 3` to read from the third column).
+- `-a, --abundance-column <INDEX>` – 1-based column holding abundances (percentages or fractions). Defaults to `2`. Adjust if abundances appear in another column.
+- `-s, --sample-id <ID>` – Sample identifier written to the `@SampleID` header. Defaults to `sample`; supply a more descriptive label for clarity.
+- `-T, --taxonomy-tag <TAG>` – Optional `@TaxonomyID` value to describe the NCBI taxonomy snapshot used (for example, `2025-06-19`).
+- `--dmp-dir <DIR>` – Directory containing `nodes.dmp` and `names.dmp`. When omitted the command uses (and, if needed, downloads) the taxdump under `~/.cami`.
+- `-o, --output <FILE>` – Write the CAMI profile to a file instead of stdout.
+
+Examples:
+
+```bash
+# Convert a TSV whose taxids live in column 2 and abundances in column 5.
+cami convert -i 2 -a 5 -s gut_sample results.tsv > gut_sample.cami
+
+# Stream results from another program and tag the taxonomy snapshot.
+other-profiler | cami convert --taxonomy-tag 2025-06-19 -s mock1 > mock1.cami
+
+# Write the converted profile directly to a file and use a custom taxdump location.
+cami convert --dmp-dir /data/taxdump -o sample.cami results.tsv
+```
+
+The generated CAMI table includes one sample populated with the modern or legacy CAMI rank set depending on the installed taxdump. Missing intermediate ranks are filled in automatically, and abundances are rounded to five decimal places to match the format expected by other `cami` subcommands.
+
 ### `cami fillup`
 
 Populate missing higher ranks for every sample using the NCBI taxdump. Abundances retain their full precision after the hierarchy is filled.
