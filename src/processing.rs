@@ -318,7 +318,65 @@ fn build_paths(sample: &Sample, rank_map: &RankMap, upto_idx: usize) -> (String,
         if let Some(detail) = rank_map.get(&idx) {
             taxids.push(detail.taxid.clone());
             names.push(detail.name.clone());
+        } else {
+            taxids.push(String::new());
+            names.push(String::new());
         }
     }
     (taxids.join("|"), names.join("|"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cami::Sample;
+
+    #[test]
+    fn build_paths_includes_placeholders_for_missing_ranks() {
+        let sample = Sample {
+            id: String::new(),
+            version: None,
+            taxonomy_tag: None,
+            ranks: vec![
+                "cellular root".to_string(),
+                "domain".to_string(),
+                "kingdom".to_string(),
+                "phylum".to_string(),
+            ],
+            rank_groups: Vec::new(),
+            rank_aliases: HashMap::new(),
+            entries: Vec::new(),
+        };
+
+        let mut rank_map: RankMap = HashMap::new();
+        rank_map.insert(
+            0,
+            RankDetail {
+                rank: "cellular root".to_string(),
+                taxid: "131567".to_string(),
+                name: "cellular organisms".to_string(),
+            },
+        );
+        rank_map.insert(
+            1,
+            RankDetail {
+                rank: "domain".to_string(),
+                taxid: "2759".to_string(),
+                name: "Eukaryota".to_string(),
+            },
+        );
+        rank_map.insert(
+            3,
+            RankDetail {
+                rank: "phylum".to_string(),
+                taxid: "5794".to_string(),
+                name: "Apicomplexa".to_string(),
+            },
+        );
+
+        let (taxpath, taxpathsn) = build_paths(&sample, &rank_map, 3);
+
+        assert_eq!(taxpath, "131567|2759||5794");
+        assert_eq!(taxpathsn, "cellular organisms|Eukaryota||Apicomplexa");
+    }
 }
