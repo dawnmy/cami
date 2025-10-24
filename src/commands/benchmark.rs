@@ -1003,18 +1003,19 @@ fn update_samples_taxonomy(
             };
             let info = cache
                 .entry(taxid)
-                .or_insert_with(|| canonical_lineage(taxonomy, taxid, group_realms))
-                .clone();
+                .or_insert_with(|| canonical_lineage(taxonomy, taxid, group_realms));
             if update_paths {
-                apply_full_update(entry, &info);
+                apply_full_update(entry, info);
             } else {
-                ensure_superkingdom_only(entry, &info);
+                ensure_superkingdom_only(entry, info);
             }
         }
     }
 }
 
 fn apply_full_update(entry: &mut Entry, info: &LineageInfo) {
+    entry.taxid.clear();
+    entry.taxid.push_str(info.resolved_taxid());
     if let Some(rank_name) = info.rank_name.as_ref() {
         entry.rank = rank_name.clone();
     } else if let Ok(canonical) = canonical_rank(&entry.rank) {
@@ -1062,6 +1063,7 @@ struct LineageInfo {
     rank_index: Option<usize>,
     rank_name: Option<String>,
     deepest_index: usize,
+    resolved_taxid: String,
 }
 
 impl LineageInfo {
@@ -1087,6 +1089,10 @@ impl LineageInfo {
                 .as_ref()
                 .map(|(tid, name)| (tid.clone(), name.clone()))
         })
+    }
+
+    fn resolved_taxid(&self) -> &str {
+        &self.resolved_taxid
     }
 }
 
@@ -1191,6 +1197,7 @@ fn canonical_lineage(taxonomy: &Taxonomy, taxid: u32, group_realms: bool) -> Lin
         rank_index,
         rank_name,
         deepest_index,
+        resolved_taxid: taxid_str,
     }
 }
 
@@ -1745,6 +1752,7 @@ mod tests {
             rank_index: Some(1),
             rank_name: Some("phylum".to_string()),
             deepest_index: 1,
+            resolved_taxid: "123".to_string(),
         };
 
         ensure_superkingdom_only(&mut entry, &info);
