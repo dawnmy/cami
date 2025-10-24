@@ -1,10 +1,10 @@
-# Build the binaries and release them when there is a new tag
 name: release
 
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -20,30 +20,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             pkgext: tar.gz
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            pkgext: tar.gz
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            pkgext: tar.gz
-          # macOS
           - os: macos-14
             target: aarch64-apple-darwin
             pkgext: tar.gz
           - os: macos-13
             target: x86_64-apple-darwin
             pkgext: tar.gz
-          # Windows
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            pkgext: zip
-          - os: windows-latest
-            target: aarch64-pc-windows-msvc
-            pkgext: zip
 
     steps:
       - uses: actions/checkout@v4
@@ -56,16 +41,11 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Linux cross deps
+      - name: Ensure jq is available (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            sudo apt-get install -y gcc-aarch64-linux-gnu
-          fi
-          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
-            sudo apt-get install -y musl-tools
-          fi
+          sudo apt-get install -y jq
 
       - name: Read version from Cargo.toml
         id: ver
@@ -83,14 +63,12 @@ jobs:
 
       - name: Build (release)
         shell: bash
+        env:
+          RUST_BACKTRACE: "1"
         run: |
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
-          fi
-          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
-            export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static"
-          fi
-          cargo build --release --locked --target ${{ matrix.target }}
+          rustc --version
+          cargo --version
+          cargo build --release --locked --target ${{ matrix.target }} -vv
 
       - name: Package
         shell: bash
@@ -101,25 +79,20 @@ jobs:
           mkdir -p "${OUTDIR}"
 
           BIN="target/${{ matrix.target }}/release/${BIN_NAME}"
-          if [ "${{ matrix.pkgext }}" = "zip" ]; then BIN="${BIN}.exe"; fi
-
           cp "${BIN}" "${OUTDIR}/"
 
-          if [ "${{ matrix.pkgext }}" != "zip" ]; then
-            strip "${OUTDIR}/${BIN_NAME}" || true
-          fi
+          # Strip (best effort) to reduce size
+          strip "${OUTDIR}/${BIN_NAME}" || true
 
+          # Include docs if present
           [ -f LICENSE ] && cp LICENSE "${OUTDIR}/" || true
           [ -f README.md ] && cp README.md "${OUTDIR}/" || true
 
-          if [ "${{ matrix.pkgext }}" = "zip" ]; then
-            (cd dist && zip -r "${NAME}.zip" "${NAME}")
-            FILE="dist/${NAME}.zip"
-          else
-            (cd dist && tar czf "${NAME}.tar.gz" "${NAME}")
-            FILE="dist/${NAME}.tar.gz"
-          fi
+          # Archive
+          (cd dist && tar czf "${NAME}.tar.gz" "${NAME}")
+          FILE="dist/${NAME}.tar.gz"
 
+          # Checksums (macOS has shasum; Linux has sha256sum)
           (shasum -a 256 "$FILE" || sha256sum "$FILE") > "${FILE}.sha256"
 
       - name: Upload artifact
