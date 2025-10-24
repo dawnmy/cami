@@ -189,6 +189,7 @@ cami benchmark -g truth.cami predictions/profiler1.cami predictions/profiler2.ca
 - `--gf` filters the ground-truth profile before scoring using the same expression language as `cami filter`.
 - `--pf` applies an expression filter to every predicted profile before metrics are computed.
 - `-n, --normalize` rescales each sample/rank in every profile so positive abundances sum to 100 prior to computing metrics.
+- `--update-taxonomy` resolves every taxid through the NCBI merged and deleted node tables so profiles recorded against different taxonomy snapshots still align before scoring.
 - `--by-domain` produces additional TSV files restricted to Bacteria, Archaea, Eukarya, and Viruses alongside the overall report.
 - `-o, --output` points to the directory where reports such as `benchmark.tsv` and `benchmark_bacteria.tsv` are written.
 - `-r, --ranks` restricts the evaluation to specific ranks; mix short forms (`p,c,g`) and full names (`phylum,class,genus`).
