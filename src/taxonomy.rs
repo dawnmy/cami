@@ -21,6 +21,8 @@ type LineageEntry = (u32, String, String);
 pub struct Taxonomy {
     nodes: HashMap<u32, TaxNode>,
     names: HashMap<u32, String>,
+    merged: HashMap<u32, u32>,
+    deleted: HashSet<u32>,
     ancestors: RwLock<HashMap<u32, Arc<[u32]>>>,
     lineages: RwLock<HashMap<u32, Arc<[LineageEntry]>>>,
     domains: RwLock<HashMap<u32, Option<String>>>,
@@ -32,6 +34,8 @@ impl Taxonomy {
     pub fn load(dir: &Path) -> Result<Self> {
         let nodes_path = dir.join("nodes.dmp");
         let names_path = dir.join("names.dmp");
+        let merged_path = dir.join("merged.dmp");
+        let delnodes_path = dir.join("delnodes.dmp");
 
         let nodes_handle = {
             let path = nodes_path.clone();
@@ -42,12 +46,28 @@ impl Taxonomy {
             thread::spawn(move || parse_names(&path))
         };
 
+        let merged_handle = {
+            let path = merged_path.clone();
+            thread::spawn(move || parse_merged(&path))
+        };
+
+        let deleted_handle = {
+            let path = delnodes_path.clone();
+            thread::spawn(move || parse_delnodes(&path))
+        };
+
         let nodes = nodes_handle
             .join()
             .map_err(|_| anyhow!("failed to parse nodes.dmp"))??;
         let names = names_handle
             .join()
             .map_err(|_| anyhow!("failed to parse names.dmp"))??;
+        let merged = merged_handle
+            .join()
+            .map_err(|_| anyhow!("failed to parse merged.dmp"))??;
+        let deleted = deleted_handle
+            .join()
+            .map_err(|_| anyhow!("failed to parse delnodes.dmp"))??;
 
         let is_modern = nodes.values().any(|node| {
             matches!(
@@ -59,6 +79,8 @@ impl Taxonomy {
         Ok(Self {
             nodes,
             names,
+            merged,
+            deleted,
             ancestors: RwLock::new(HashMap::new()),
             lineages: RwLock::new(HashMap::new()),
             domains: RwLock::new(HashMap::new()),
@@ -184,6 +206,60 @@ impl Taxonomy {
     pub fn uses_modern_ranks(&self) -> bool {
         self.is_modern
     }
+
+    pub fn resolve_taxid(&self, taxid: u32) -> Option<u32> {
+        if self.nodes.contains_key(&taxid) {
+            return Some(taxid);
+        }
+
+        if let Some(&merged) = self.merged.get(&taxid) {
+            let mut visited = HashSet::new();
+            let mut current = merged;
+            visited.insert(taxid);
+
+            while !self.nodes.contains_key(&current) {
+                if !visited.insert(current) {
+                    eprintln!(
+                        "warning: taxid {taxid} could not be resolved because merged targets form a cycle"
+                    );
+                    return None;
+                }
+                if let Some(&next) = self.merged.get(&current) {
+                    current = next;
+                    continue;
+                }
+                if self.deleted.contains(&current) {
+                    eprintln!("warning: taxid {taxid} was merged into deleted taxid {current}");
+                    return None;
+                }
+                eprintln!("warning: taxid {taxid} was merged into unknown taxid {current}");
+                return None;
+            }
+
+            let name = self
+                .names
+                .get(&current)
+                .cloned()
+                .unwrap_or_else(|| current.to_string());
+            eprintln!("warning: taxid {taxid} has been merged into {current} ({name})");
+            return Some(current);
+        }
+
+        if self.deleted.contains(&taxid) {
+            eprintln!("warning: taxid {taxid} has been deleted from the NCBI taxonomy");
+            return None;
+        }
+
+        eprintln!("warning: taxid {taxid} is not present in the NCBI taxonomy");
+        None
+    }
+
+    pub fn resolve_taxid_str(&self, value: &str) -> Option<u32> {
+        let Ok(raw) = value.trim().parse::<u32>() else {
+            return None;
+        };
+        self.resolve_taxid(raw)
+    }
 }
 
 pub fn ensure_taxdump(dir: &Path) -> Result<()> {
@@ -264,12 +340,60 @@ fn parse_names(path: &Path) -> Result<HashMap<u32, String>> {
     Ok(names)
 }
 
-pub fn parse_taxid(taxid: &str) -> Option<u32> {
-    taxid.parse().ok()
-}
-
 fn canonicalize_rank(rank: &str) -> String {
     rank.trim().to_string()
+}
+
+fn parse_merged(path: &Path) -> Result<HashMap<u32, u32>> {
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut merged = HashMap::new();
+    for line in reader.lines() {
+        let l = line?;
+        let parts: Vec<&str> = l.split('|').collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let from: u32 = parts[0]
+            .trim_matches(|c: char| c.is_whitespace())
+            .parse()
+            .unwrap_or(0);
+        let to: u32 = parts[1]
+            .trim_matches(|c: char| c.is_whitespace())
+            .parse()
+            .unwrap_or(0);
+        if from > 0 && to > 0 {
+            merged.insert(from, to);
+        }
+    }
+    Ok(merged)
+}
+
+fn parse_delnodes(path: &Path) -> Result<HashSet<u32>> {
+    if !path.exists() {
+        return Ok(HashSet::new());
+    }
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut deleted = HashSet::new();
+    for line in reader.lines() {
+        let l = line?;
+        let parts: Vec<&str> = l.split('|').collect();
+        if parts.is_empty() {
+            continue;
+        }
+        let taxid: u32 = parts[0]
+            .trim_matches(|c: char| c.is_whitespace())
+            .parse()
+            .unwrap_or(0);
+        if taxid > 0 {
+            deleted.insert(taxid);
+        }
+    }
+    Ok(deleted)
 }
 
 #[cfg(test)]
@@ -301,6 +425,8 @@ mod tests {
         let taxonomy = Taxonomy {
             nodes,
             names,
+            merged: HashMap::new(),
+            deleted: HashSet::new(),
             ancestors: RwLock::new(HashMap::new()),
             lineages: RwLock::new(HashMap::new()),
             domains: RwLock::new(HashMap::new()),

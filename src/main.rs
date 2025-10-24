@@ -171,7 +171,8 @@ enum Commands {
         )]
         from_rank: Option<String>,
         #[arg(
-            long,
+            long = "to",
+            alias = "to-rank",
             default_value = "phylum",
             help = "Highest rank to build during fill-up (inclusive)."
         )]
@@ -254,7 +255,8 @@ enum Commands {
         #[arg(short, long, help = "Write output to a file instead of stdout.")]
         output: Option<PathBuf>,
         #[arg(
-            long,
+            long = "to",
+            alias = "to-rank",
             help = "Highest rank to fill to (inclusive); defaults to the first declared rank."
         )]
         to_rank: Option<String>,

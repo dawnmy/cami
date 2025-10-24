@@ -144,13 +144,13 @@ The generated CAMI table includes one sample populated with the modern or legacy
 
 ### cami fillup
 
-Populate missing higher ranks for every sample using the NCBI taxdump. Abundances retain their full precision after the hierarchy is filled.
+Populate missing higher ranks for every sample using the NCBI taxdump. Abundances retain their full precision after the hierarchy is filled, and the command adapts to either the legacy or modern CAMI rank sets present in your taxonomy snapshot.
 
 ```bash
-cami fillup --to-rank family examples/test.cami > with_family.cami
+cami fillup --to family examples/test.cami > with_family.cami
 ```
 
-If `--to-rank` is omitted, the command fills to the highest rank declared in each sample. Use `--from <rank>` to choose the source rank used for aggregation (defaults to `species` when available).
+If `--to` is omitted, the command fills to the highest rank declared in each sample. Use `--from <rank>` to choose the source rank used for aggregation (defaults to `species` when available). When an entry references a taxid that has been merged or deleted, `cami fillup` prints a warning to stderr but keeps processing the rest of the table.
 
 ### cami renorm
 
@@ -221,4 +221,4 @@ Remember that each command reads from stdin when no input path is supplied and w
 
 ### Taxonomy data cache
 
-Commands that require lineage information (`filter --fill-up`, `fillup`) download the NCBI taxdump once and cache it under `~/.cami`. Subsequent runs reuse the cached files. You can remove the directory to force a refresh.
+Commands that require lineage information (`filter --fill-up`, `fillup`, `convert`, `benchmark` with taxonomy updates, etc.) automatically download the NCBI taxdump the first time you run `cami` and cache the extracted files under `~/.cami`. Later runs reuse that directory as the default taxdump source. To refresh the taxonomy, download the latest taxdump from NCBI and replace the files in `~/.cami` (or remove the directory to trigger a fresh download). When cached taxonomy data indicates that a taxid has been merged or deleted, the affected commands emit warnings on stderr but continue producing complete output.
