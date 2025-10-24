@@ -83,14 +83,13 @@ jobs:
           mkdir -p "${OUTDIR}"
 
           BIN="target/${{ matrix.target }}/release/${BIN_NAME}"
-          cp "${BIN}" "${OUTDIR}/"  # (no .exe on these targets)
+          cp "${BIN}" "${OUTDIR}/"
 
-          # Best-effort strip to reduce size
+          # Try to strip binary to reduce size (ignore errors)
           strip "${OUTDIR}/${BIN_NAME}" || true
 
-          # Include docs if present
+          # Include license (no README)
           [ -f LICENSE ] && cp LICENSE "${OUTDIR}/" || true
-          [ -f README.md ] && cp README.md "${OUTDIR}/" || true
 
           # Archive
           (cd dist && tar czf "${NAME}.tar.gz" "${NAME}")
@@ -115,11 +114,11 @@ jobs:
         with:
           path: dist
 
-      - name: Flatten artifacts
+      - name: Flatten artifacts (only tar.gz and sha256)
         shell: bash
         run: |
           mkdir -p upload
-          find dist -type f -print -exec cp {} upload/ \;
+          find dist -type f \( -name '*.tar.gz' -o -name '*.sha256' \) -print -exec cp {} upload/ \;
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
