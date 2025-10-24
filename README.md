@@ -164,12 +164,12 @@ cami renorm examples/test.cami > renormalized.cami
 
 Reorder taxa within each rank for every sample.
 
-- `--abundance` sorts taxa by descending abundance and removes entries whose abundance is exactly zero.
-- `--taxpath [taxpath|taxpathsn]` sorts by the lineage strings so related taxa stay together. The default field is `taxpath` when `-t` is passed without a value.
+- `-a`/`--abundance` sorts taxa by descending abundance and removes entries whose abundance is exactly zero.
+- `-t`/`--taxpath [taxpath|taxpathsn]` sorts by the lineage strings so related taxa stay together. The default field is `taxpath` when `-t` is passed without a value.
 
 ```bash
 cami sort --abundance examples/test.cami > sorted.cami
-cami sort --taxpathsn examples/test.cami > lineage_sorted.cami
+cami sort --taxpath examples/test.cami > lineage_sorted.cami
 ```
 
 ### cami benchmark
