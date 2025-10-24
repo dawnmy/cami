@@ -1,0 +1,170 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  BIN_NAME: cami
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            pkgext: tar.gz
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            pkgext: tar.gz
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            pkgext: tar.gz
+          # macOS (Apple Silicon + Intel)
+          - os: macos-14
+            target: aarch64-apple-darwin
+            pkgext: tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            pkgext: tar.gz
+          # Windows (x64 + ARM64)
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            pkgext: zip
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            pkgext: zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Linux build deps for cross targets
+      - name: Linux cross deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          case "${{ matrix.target }}" in
+            aarch64-unknown-linux-gnu)
+              sudo apt-get install -y gcc-aarch64-linux-gnu
+              ;;
+            x86_64-unknown-linux-musl)
+              sudo apt-get install -y musl-tools
+              ;;
+          esac
+
+      - name: Read version from Cargo.toml
+        id: ver
+        shell: bash
+        run: |
+          # Use Python (available on all runners) to parse Cargo metadata reliably
+          VERSION=$(python - <<'PY'
+import json, subprocess, sys
+meta = subprocess.check_output(["cargo","metadata","--format-version","1","--no-deps","-q"], text=True)
+for pkg in json.loads(meta)["packages"]:
+    if pkg["name"]=="cami":
+        print(pkg["version"])
+        break
+else:
+    sys.exit("cami package not found in cargo metadata")
+PY
+)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          # Optional: ensure tag matches v<version>
+          TAG="${GITHUB_REF_NAME}" # e.g. v0.1.0
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "Tag ($TAG) does not match Cargo.toml version (v$VERSION)"; exit 1
+          fi
+
+      - name: Build (release)
+        shell: bash
+        run: |
+          # Cross-compile knobs
+          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]]; then
+            export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+          fi
+          # For MUSL you can force fully static by enabling crt-static:
+          if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-musl" ]]; then
+            export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static"
+          fi
+          cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          VER="${{ steps.ver.outputs.version }}"
+          NAME="${BIN_NAME}-v${VER}-${{ matrix.target }}"
+          OUTDIR="dist/${NAME}"
+          mkdir -p "${OUTDIR}"
+
+          BIN="target/${{ matrix.target }}/release/${BIN_NAME}"
+          # Windows exe
+          if [[ "${{ matrix.pkgext }}" == "zip" ]]; then BIN="${BIN}.exe"; fi
+
+          cp "${BIN}" "${OUTDIR}/"
+
+          # Strip (best effort) to reduce size where supported
+          if [[ "${{ matrix.pkgext }}" != "zip" ]]; then
+            strip "${OUTDIR}/${BIN_NAME}" || true
+          fi
+
+          # Include docs if present
+          [ -f LICENSE ] && cp LICENSE "${OUTDIR}/" || true
+          [ -f README.md ] && cp README.md "${OUTDIR}/" || true
+
+          # Archive
+          if [[ "${{ matrix.pkgext }}" == "zip" ]]; then
+            (cd dist && zip -r "${NAME}.zip" "${NAME}")
+            FILE="dist/${NAME}.zip"
+          else
+            (cd dist && tar czf "${NAME}.tar.gz" "${NAME}")
+            FILE="dist/${NAME}.tar.gz"
+          fi
+
+          # Checksums (macOS has shasum, Linux has sha256sum; try both)
+          (shasum -a 256 "$FILE" || sha256sum "$FILE") > "${FILE}.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+
+  release:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p upload
+          find dist -type f -maxdepth 3 -print -exec cp {} upload/ \;
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: upload/*
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }} # e.g. v1.2.3-rc1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
