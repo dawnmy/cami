@@ -1,5 +1,5 @@
 use crate::cami::{Entry, Sample};
-use crate::taxonomy::{Taxonomy, parse_taxid};
+use crate::taxonomy::Taxonomy;
 use std::collections::{BTreeSet, HashMap};
 
 #[derive(Clone)]
@@ -264,7 +264,7 @@ where
 }
 
 fn build_rank_map(sample: &Sample, taxonomy: &Taxonomy, taxid: &str) -> Option<RankMap> {
-    let tid = parse_taxid(taxid)?;
+    let tid = taxonomy.resolve_taxid_str(taxid)?;
     let lineage = taxonomy.lineage(tid);
     let mut map: RankMap = HashMap::new();
     for (tid_u32, rank, name) in lineage.iter() {
