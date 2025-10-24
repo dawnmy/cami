@@ -4,7 +4,7 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
+  workflow_dispatch: {}  # allow manual runs from branches for dry-run builds
 
 permissions:
   contents: write
@@ -56,9 +56,13 @@ jobs:
             echo "Failed to get version for cami from cargo metadata"; exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          TAG="${GITHUB_REF_NAME}"  # e.g. v0.1.0
-          if [ "$TAG" != "v$VERSION" ]; then
-            echo "Tag ($TAG) does not match Cargo.toml version (v$VERSION)"; exit 1
+
+          # Enforce tag==version only on tag pushes
+          if [ "${GITHUB_EVENT_NAME}" = "push" ] && [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF_NAME}"  # e.g. v0.1.2
+            if [ "$TAG" != "v$VERSION" ]; then
+              echo "Tag ($TAG) does not match Cargo.toml version (v$VERSION)"; exit 1
+            fi
           fi
 
       - name: Build (release)
@@ -79,9 +83,9 @@ jobs:
           mkdir -p "${OUTDIR}"
 
           BIN="target/${{ matrix.target }}/release/${BIN_NAME}"
-          cp "${BIN}" "${OUTDIR}/"
+          cp "${BIN}" "${OUTDIR}/"  # (no .exe on these targets)
 
-          # Strip (best effort) to reduce size
+          # Best-effort strip to reduce size
           strip "${OUTDIR}/${BIN_NAME}" || true
 
           # Include docs if present
@@ -105,12 +109,14 @@ jobs:
     name: publish
     needs: build
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')  # only publish on tags
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: dist
 
       - name: Flatten artifacts
+        shell: bash
         run: |
           mkdir -p upload
           find dist -type f -print -exec cp {} upload/ \;
