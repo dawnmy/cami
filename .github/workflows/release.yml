@@ -4,7 +4,22 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch: {}  # allow manual runs from branches for dry-run builds
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (e.g., v0.1.3)"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark as pre-release?"
+        required: false
+        default: false
+        type: boolean
+      draft:
+        description: "Create as draft?"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -22,13 +37,10 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            pkgext: tar.gz
           - os: macos-14
             target: aarch64-apple-darwin
-            pkgext: tar.gz
           - os: macos-13
             target: x86_64-apple-darwin
-            pkgext: tar.gz
 
     steps:
       - uses: actions/checkout@v4
@@ -47,6 +59,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq
 
+      - name: Ensure jq is available (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          if ! command -v jq >/dev/null 2>&1; then
+            brew update
+            brew install jq
+          fi
+
       - name: Read version from Cargo.toml
         id: ver
         shell: bash
@@ -57,11 +77,25 @@ jobs:
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-          # Enforce tag==version only on tag pushes
+          # Enforce tag==version for tag pushes
           if [ "${GITHUB_EVENT_NAME}" = "push" ] && [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            TAG="${GITHUB_REF_NAME}"  # e.g. v0.1.2
+            TAG="${GITHUB_REF_NAME}"
             if [ "$TAG" != "v$VERSION" ]; then
               echo "Tag ($TAG) does not match Cargo.toml version (v$VERSION)"; exit 1
+            fi
+          fi
+
+          # Enforce tag==version for manual runs (workflow_dispatch)
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+            if [ -z "$TAG" ]; then
+              echo "Missing required input 'tag'"; exit 1
+            fi
+            if [[ ! "$TAG" =~ ^v[0-9]+(\.[0-9]+){1,2}(-.+)?$ ]]; then
+              echo "Input tag must look like vMAJOR.MINOR.PATCH (e.g., v0.1.3)"; exit 1
+            fi
+            if [ "$TAG" != "v$VERSION" ]; then
+              echo "Input tag ($TAG) does not match Cargo.toml version (v$VERSION)"; exit 1
             fi
           fi
 
@@ -74,57 +108,73 @@ jobs:
           cargo --version
           cargo build --release --locked --target ${{ matrix.target }} -vv
 
-      - name: Package
+      - name: Package (tar.gz with binary at root)
         shell: bash
         run: |
+          set -euo pipefail
           VER="${{ steps.ver.outputs.version }}"
-          NAME="${BIN_NAME}-v${VER}-${{ matrix.target }}"
-          OUTDIR="dist/${NAME}"
-          mkdir -p "${OUTDIR}"
+          ARCHIVE_NAME="${BIN_NAME}-v${VER}-${{ matrix.target }}.tar.gz"
 
-          BIN="target/${{ matrix.target }}/release/${BIN_NAME}"
-          cp "${BIN}" "${OUTDIR}/"
+          # Stage a single binary named 'cami' (no enclosing folder)
+          BIN_PATH="target/${{ matrix.target }}/release/${BIN_NAME}"
+          STAGE_DIR="dist/stage-${{ matrix.target }}"
+          mkdir -p "$STAGE_DIR"
+          cp "$BIN_PATH" "$STAGE_DIR/cami"
 
-          # Try to strip binary to reduce size (ignore errors)
-          strip "${OUTDIR}/${BIN_NAME}" || true
+          # Best-effort strip
+          strip "$STAGE_DIR/cami" || true
 
-          # Include license (no README)
-          [ -f LICENSE ] && cp LICENSE "${OUTDIR}/" || true
-
-          # Archive
-          (cd dist && tar czf "${NAME}.tar.gz" "${NAME}")
-          FILE="dist/${NAME}.tar.gz"
-
-          # Checksums (macOS has shasum; Linux has sha256sum)
-          (shasum -a 256 "$FILE" || sha256sum "$FILE") > "${FILE}.sha256"
+          # Create archive with just the binary at archive root
+          mkdir -p dist
+          tar -C "$STAGE_DIR" -czf "dist/${ARCHIVE_NAME}" cami
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: dist/*
+          path: dist/*.tar.gz
 
   release:
     name: publish
     needs: build
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')  # only publish on tags
+    # Publish on tag pushes OR on manual runs
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: dist
 
-      - name: Flatten artifacts (only tar.gz and sha256)
+      - name: Collect only tarballs
         shell: bash
         run: |
           mkdir -p upload
-          find dist -type f \( -name '*.tar.gz' -o -name '*.sha256' \) -print -exec cp {} upload/ \;
+          find dist -type f -name '*.tar.gz' -print -exec cp {} upload/ \;
 
-      - name: Create GitHub Release
+      - name: Determine tag/prerelease/draft
+        id: meta
+        shell: bash
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "push" ] && [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+            PRERELEASE="${{ contains(github.ref_name, '-') && 'true' || 'false' }}"
+            DRAFT="false"
+          else
+            TAG="${{ github.event.inputs.tag }}"
+            PRERELEASE="${{ github.event.inputs.prerelease }}"
+            DRAFT="${{ github.event.inputs.draft }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "draft=$DRAFT" >> "$GITHUB_OUTPUT"
+
+      - name: Create / Update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: upload/*
-          draft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          tag_name: ${{ steps.meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          files: upload/*.tar.gz
+          draft: ${{ steps.meta.outputs.draft }}
+          prerelease: ${{ steps.meta.outputs.prerelease }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
