@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail, ensure};
 use crate::cami;
 use crate::cami::{Entry, Sample};
 use crate::expression::{apply_filter, expr_needs_taxdump, parse_expression};
-use crate::taxonomy::{Taxonomy, default_taxdump_dir, ensure_taxdump, parse_taxid};
+use crate::taxonomy::{Taxonomy, default_taxdump_dir, ensure_taxdump};
 
 #[derive(Clone)]
 pub struct BenchmarkConfig {
@@ -396,10 +396,10 @@ fn entry_domain_candidates(
             }
         };
 
-        if let Some(tid) = highest_taxid_in_taxpath(entry) {
+        if let Some(tid) = highest_taxid_in_taxpath(entry, Some(tax)) {
             visit_taxid(tid);
         }
-        if let Some(tid) = parse_taxid(&entry.taxid) {
+        if let Some(tid) = tax.resolve_taxid_str(&entry.taxid) {
             visit_taxid(tid);
         }
     }
@@ -434,8 +434,8 @@ fn component_is_virus_realm(name: &str) -> bool {
     lower.contains("viria") || lower.contains("virae") || lower.contains("viruses")
 }
 
-fn highest_taxid_in_taxpath(entry: &Entry) -> Option<u32> {
-    entry
+fn highest_taxid_in_taxpath(entry: &Entry, taxonomy: Option<&Taxonomy>) -> Option<u32> {
+    let raw = entry
         .taxpath
         .split('|')
         .map(|tid| tid.trim())
@@ -443,10 +443,15 @@ fn highest_taxid_in_taxpath(entry: &Entry) -> Option<u32> {
             if tid.is_empty() {
                 None
             } else {
-                parse_taxid(tid).filter(|id| *id > 1)
+                tid.parse::<u32>().ok().filter(|id| *id > 1)
             }
         })
-        .or_else(|| parse_taxid(&entry.taxid))
+        .or_else(|| entry.taxid.trim().parse::<u32>().ok());
+
+    match (taxonomy, raw) {
+        (Some(tax), Some(id)) => tax.resolve_taxid(id),
+        (_, value) => value,
+    }
 }
 
 #[derive(Default)]
@@ -814,7 +819,7 @@ fn canonical_rank_index(rank: &str) -> Option<usize> {
 }
 
 fn lineage_cache_key(entry: &Entry, canonical_rank: &str) -> String {
-    let base = if let Some(tid) = parse_taxid(&entry.taxid) {
+    let base = if let Ok(tid) = entry.taxid.trim().parse::<u32>() {
         format!("taxid:{}", tid)
     } else if !entry.taxpath.trim().is_empty() {
         entry.taxpath.trim().to_string()
@@ -838,7 +843,10 @@ fn compute_lineage(
     let mut result = vec![None; CANONICAL_RANKS.len()];
 
     if let Some(taxonomy) = taxonomy {
-        if let Some(taxid) = parse_taxid(&entry.taxid).or_else(|| highest_taxid_in_taxpath(entry)) {
+        if let Some(taxid) = taxonomy
+            .resolve_taxid_str(&entry.taxid)
+            .or_else(|| highest_taxid_in_taxpath(entry, Some(taxonomy)))
+        {
             fill_lineage_from_taxonomy(&mut result, entry_rank_index, taxonomy, taxid);
         }
     }
@@ -963,7 +971,7 @@ fn entry_missing_superkingdom(entry: &Entry) -> bool {
 
     let id_present = id_parts
         .next()
-        .and_then(|value| parse_taxid(value))
+        .and_then(|value| value.parse::<u32>().ok())
         .map(|tid| matches!(tid, 2 | 2157 | 2759 | 10239))
         .unwrap_or(false);
 
@@ -990,23 +998,24 @@ fn update_samples_taxonomy(
 ) {
     for sample in samples.iter_mut() {
         for entry in sample.entries.iter_mut() {
-            let Some(taxid) = parse_taxid(&entry.taxid) else {
+            let Some(taxid) = taxonomy.resolve_taxid_str(&entry.taxid) else {
                 continue;
             };
             let info = cache
                 .entry(taxid)
-                .or_insert_with(|| canonical_lineage(taxonomy, taxid, group_realms))
-                .clone();
+                .or_insert_with(|| canonical_lineage(taxonomy, taxid, group_realms));
             if update_paths {
-                apply_full_update(entry, &info);
+                apply_full_update(entry, info);
             } else {
-                ensure_superkingdom_only(entry, &info);
+                ensure_superkingdom_only(entry, info);
             }
         }
     }
 }
 
 fn apply_full_update(entry: &mut Entry, info: &LineageInfo) {
+    entry.taxid.clear();
+    entry.taxid.push_str(info.resolved_taxid());
     if let Some(rank_name) = info.rank_name.as_ref() {
         entry.rank = rank_name.clone();
     } else if let Ok(canonical) = canonical_rank(&entry.rank) {
@@ -1054,6 +1063,7 @@ struct LineageInfo {
     rank_index: Option<usize>,
     rank_name: Option<String>,
     deepest_index: usize,
+    resolved_taxid: String,
 }
 
 impl LineageInfo {
@@ -1079,6 +1089,10 @@ impl LineageInfo {
                 .as_ref()
                 .map(|(tid, name)| (tid.clone(), name.clone()))
         })
+    }
+
+    fn resolved_taxid(&self) -> &str {
+        &self.resolved_taxid
     }
 }
 
@@ -1183,6 +1197,7 @@ fn canonical_lineage(taxonomy: &Taxonomy, taxid: u32, group_realms: bool) -> Lin
         rank_index,
         rank_name,
         deepest_index,
+        resolved_taxid: taxid_str,
     }
 }
 
@@ -1212,7 +1227,9 @@ fn normalize_taxid_component(raw: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    parse_taxid(trimmed)
+    trimmed
+        .parse::<u32>()
+        .ok()
         .filter(|id| *id != 0)
         .map(|id| format!("taxid:{}", id))
 }
@@ -1223,7 +1240,10 @@ fn infer_superkingdom(
     group_realms: bool,
 ) -> Option<String> {
     if let Some(taxonomy) = taxonomy {
-        if let Some(tid) = parse_taxid(&entry.taxid).or_else(|| highest_taxid_in_taxpath(entry)) {
+        if let Some(tid) = taxonomy
+            .resolve_taxid_str(&entry.taxid)
+            .or_else(|| highest_taxid_in_taxpath(entry, Some(taxonomy)))
+        {
             if group_realms {
                 if let Some(realm) = taxonomy.realm_of(tid) {
                     if component_is_virus_realm(&realm) {
@@ -1732,6 +1752,7 @@ mod tests {
             rank_index: Some(1),
             rank_name: Some("phylum".to_string()),
             deepest_index: 1,
+            resolved_taxid: "123".to_string(),
         };
 
         ensure_superkingdom_only(&mut entry, &info);
@@ -2007,7 +2028,7 @@ mod tests {
             hosts: None,
         };
 
-        assert_eq!(highest_taxid_in_taxpath(&entry), Some(2_731_618));
+        assert_eq!(highest_taxid_in_taxpath(&entry, None), Some(2_731_618));
     }
 
     #[test]
@@ -2023,6 +2044,6 @@ mod tests {
             hosts: None,
         };
 
-        assert_eq!(highest_taxid_in_taxpath(&entry), Some(12_345));
+        assert_eq!(highest_taxid_in_taxpath(&entry, None), Some(12_345));
     }
 }

@@ -1,5 +1,5 @@
 use crate::cami::{Entry, Sample};
-use crate::taxonomy::{Taxonomy, parse_taxid};
+use crate::taxonomy::Taxonomy;
 use anyhow::{Result, anyhow, bail};
 use regex::Regex;
 use std::cmp::Ordering;
@@ -740,8 +740,8 @@ fn eval_tax(atom: &str, entry: &Entry, taxonomy: Option<&Taxonomy>) -> Option<bo
 }
 
 fn eval_taxonomy(entry: &Entry, taxonomy: &Taxonomy, op: &str, value: &str) -> bool {
-    let entry_taxid = parse_taxid(&entry.taxid);
-    let target_taxid = parse_taxid(value);
+    let entry_taxid = taxonomy.resolve_taxid_str(&entry.taxid);
+    let target_taxid = taxonomy.resolve_taxid_str(value);
 
     match op {
         "==" => match (entry_taxid, target_taxid) {
