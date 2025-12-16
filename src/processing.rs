@@ -135,9 +135,11 @@ pub fn fill_up_to(
 
             for taxid in taxids {
                 let existing_entry = existing_by_key.get(&(idx, taxid.clone()));
-                let percentage = existing_entry
-                    .map(|e| e.percentage)
-                    .unwrap_or_else(|| *sums.get(&(idx, taxid.clone())).unwrap_or(&0.0));
+                let percentage = sums
+                    .get(&(idx, taxid.clone()))
+                    .cloned()
+                    .or_else(|| existing_entry.map(|e| e.percentage))
+                    .unwrap_or(0.0);
                 if percentage <= 0.0 {
                     continue;
                 }
