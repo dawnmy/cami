@@ -107,9 +107,6 @@ pub fn fill_up_to(
                     continue;
                 }
                 if let Some(detail) = rank_map.get(&rank_idx) {
-                    if existing_by_key.contains_key(&(rank_idx, detail.taxid.clone())) {
-                        continue;
-                    }
                     *sums.entry((rank_idx, detail.taxid.clone())).or_insert(0.0) +=
                         entry.percentage;
                 }
@@ -135,11 +132,8 @@ pub fn fill_up_to(
 
             for taxid in taxids {
                 let existing_entry = existing_by_key.get(&(idx, taxid.clone()));
-                let percentage = sums
-                    .get(&(idx, taxid.clone()))
-                    .cloned()
-                    .or_else(|| existing_entry.map(|e| e.percentage))
-                    .unwrap_or(0.0);
+                let percentage = sums.get(&(idx, taxid.clone())).cloned().unwrap_or(0.0)
+                    + existing_entry.map(|e| e.percentage).unwrap_or(0.0);
                 if percentage <= 0.0 {
                     continue;
                 }
