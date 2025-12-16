@@ -92,7 +92,7 @@ pub fn fill_up_to(
             let Some(entry_rank_idx) = sample.rank_index(&entry.rank) else {
                 continue;
             };
-            if entry_rank_idx != base_idx {
+            if entry_rank_idx < start_idx || entry_rank_idx > base_idx {
                 continue;
             }
             let fallback_entry = existing_by_key.get(&(entry_rank_idx, entry.taxid.clone()));
@@ -103,7 +103,7 @@ pub fn fill_up_to(
             };
 
             for rank_idx in start_idx..=end_idx {
-                if rank_idx == entry_rank_idx {
+                if rank_idx == entry_rank_idx || rank_idx > entry_rank_idx {
                     continue;
                 }
                 if let Some(detail) = rank_map.get(&rank_idx) {
@@ -266,7 +266,10 @@ fn build_rank_map(sample: &Sample, taxonomy: &Taxonomy, taxid: &str) -> Option<R
     let mut map: RankMap = HashMap::new();
     for (tid_u32, rank, name) in lineage.iter() {
         let mut effective_rank = rank.clone();
-        if sample.rank_index(&effective_rank).is_none() && rank.eq_ignore_ascii_case("no rank") {
+        if rank.eq_ignore_ascii_case("no rank") {
+            if *tid_u32 != tid {
+                continue;
+            }
             if sample.rank_index("strain").is_some() {
                 effective_rank = "strain".to_string();
             }
