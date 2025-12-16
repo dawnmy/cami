@@ -207,11 +207,6 @@ fn select_base_rank(sample: &Sample, from_rank: Option<&str>) -> Option<usize> {
             }
         }
     }
-    if let Some(idx) = sample.rank_index("species") {
-        if has_entries_at(sample, idx) {
-            return Some(idx);
-        }
-    }
     sample
         .ranks
         .iter()
