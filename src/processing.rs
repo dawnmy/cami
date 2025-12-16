@@ -135,9 +135,11 @@ pub fn fill_up_to(
 
             for taxid in taxids {
                 let existing_entry = existing_by_key.get(&(idx, taxid.clone()));
-                let percentage = existing_entry
-                    .map(|e| e.percentage)
-                    .unwrap_or_else(|| *sums.get(&(idx, taxid.clone())).unwrap_or(&0.0));
+                let percentage = sums
+                    .get(&(idx, taxid.clone()))
+                    .cloned()
+                    .or_else(|| existing_entry.map(|e| e.percentage))
+                    .unwrap_or(0.0);
                 if percentage <= 0.0 {
                     continue;
                 }
@@ -205,11 +207,6 @@ fn select_base_rank(sample: &Sample, from_rank: Option<&str>) -> Option<usize> {
             if has_entries_at(sample, idx) {
                 return Some(idx);
             }
-        }
-    }
-    if let Some(idx) = sample.rank_index("species") {
-        if has_entries_at(sample, idx) {
-            return Some(idx);
         }
     }
     sample
