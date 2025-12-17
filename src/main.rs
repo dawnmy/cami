@@ -302,6 +302,16 @@ enum Commands {
         )]
         abundance_column: usize,
         #[arg(
+            long = "input-percent",
+            help = "Treat abundances as percentages instead of fractions (0-1)."
+        )]
+        input_percent: bool,
+        #[arg(
+            long = "norm",
+            help = "Normalize abundances to total 100 before converting."
+        )]
+        normalize: bool,
+        #[arg(
             short = 's',
             long = "sample-id",
             value_name = "ID",
@@ -454,6 +464,8 @@ fn main() -> Result<()> {
             output,
             taxid_column,
             abundance_column,
+            input_percent,
+            normalize,
             sample_id,
             taxonomy_tag,
             dmp_dir,
@@ -463,6 +475,8 @@ fn main() -> Result<()> {
                 output: output.as_ref(),
                 taxid_column: *taxid_column,
                 abundance_column: *abundance_column,
+                input_is_percent: *input_percent,
+                normalize: *normalize,
                 sample_id,
                 taxonomy_tag: taxonomy_tag.as_deref(),
                 dmp_dir: dmp_dir.as_ref(),

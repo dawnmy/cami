@@ -15,6 +15,8 @@ pub struct ConvertConfig<'a> {
     pub output: Option<&'a PathBuf>,
     pub taxid_column: usize,
     pub abundance_column: usize,
+    pub input_is_percent: bool,
+    pub normalize: bool,
     pub sample_id: &'a str,
     pub dmp_dir: Option<&'a PathBuf>,
     pub taxonomy_tag: Option<&'a str>,
@@ -54,9 +56,33 @@ pub fn run(cfg: &ConvertConfig) -> Result<()> {
         bail!("no data rows found in input TSV");
     }
 
+    let scale = if cfg.input_is_percent { 1.0 } else { 100.0 };
+    let total: f64 = records
+        .iter()
+        .map(|(_, _, abundance)| abundance * scale)
+        .sum();
+    let norm_factor = if cfg.normalize {
+        if total == 0.0 {
+            bail!("cannot normalize because total abundance is zero");
+        }
+        100.0 / total
+    } else {
+        1.0
+    };
+
     for (taxid_str, taxid_value, abundance) in records {
+        let resolved_taxid = match taxonomy.resolve_taxid(taxid_value) {
+            Some(value) => value,
+            None => {
+                eprintln!(
+                    "warning: skipping taxid {taxid_str} because it is not present in the taxonomy"
+                );
+                continue;
+            }
+        };
+
         let mut rank = taxonomy
-            .rank_of(taxid_value)
+            .rank_of(resolved_taxid)
             .unwrap_or_else(|| "no rank".to_string());
         if sample.rank_index(&rank).is_none() && rank.eq_ignore_ascii_case("no rank") {
             if sample.rank_index("strain").is_some() {
@@ -71,11 +97,11 @@ pub fn run(cfg: &ConvertConfig) -> Result<()> {
             );
         }
         sample.entries.push(Entry {
-            taxid: taxid_str,
+            taxid: resolved_taxid.to_string(),
             rank,
             taxpath: String::new(),
             taxpathsn: String::new(),
-            percentage: abundance,
+            percentage: abundance * scale * norm_factor,
             cami_genome_id: None,
             cami_otu: None,
             hosts: None,
