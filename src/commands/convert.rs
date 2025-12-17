@@ -70,6 +70,7 @@ pub fn run(cfg: &ConvertConfig) -> Result<()> {
         1.0
     };
 
+    let mut aggregated: HashMap<(String, String), f64> = HashMap::new();
     for (taxid_str, taxid_value, abundance) in records {
         let resolved_taxid = match taxonomy.resolve_taxid(taxid_value) {
             Some(value) => value,
@@ -89,19 +90,31 @@ pub fn run(cfg: &ConvertConfig) -> Result<()> {
                 rank = "strain".to_string();
             }
         }
-        if sample.rank_index(&rank).is_none() {
-            bail!(
-                "rank '{}' for taxid {} is not present in the @Ranks header",
-                rank,
-                taxid_str
+        let Some((target_taxid, target_rank)) =
+            target_rank_for_entry(&sample, &taxonomy, resolved_taxid, &rank)
+        else {
+            eprintln!(
+                "warning: skipping taxid {taxid_str} because none of its ancestor ranks are present in the @Ranks header"
             );
-        }
+            continue;
+        };
+
+        let percentage = abundance * scale * norm_factor;
+        aggregated
+            .entry((target_taxid, target_rank))
+            .and_modify(|value| *value += percentage)
+            .or_insert(percentage);
+    }
+
+    let mut aggregated_entries: Vec<_> = aggregated.into_iter().collect();
+    aggregated_entries.sort_by(|a, b| a.0.0.cmp(&b.0.0).then_with(|| a.0.1.cmp(&b.0.1)));
+    for ((taxid, rank), percentage) in aggregated_entries {
         sample.entries.push(Entry {
-            taxid: resolved_taxid.to_string(),
+            taxid,
             rank,
             taxpath: String::new(),
             taxpathsn: String::new(),
-            percentage: abundance * scale * norm_factor,
+            percentage,
             cami_genome_id: None,
             cami_otu: None,
             hosts: None,
@@ -164,6 +177,32 @@ fn read_records(cfg: &ConvertConfig) -> Result<Vec<(String, u32, f64)>> {
     }
 
     Ok(records)
+}
+
+fn target_rank_for_entry(
+    sample: &Sample,
+    taxonomy: &Taxonomy,
+    taxid: u32,
+    rank: &str,
+) -> Option<(String, String)> {
+    if sample.rank_index(rank).is_some() {
+        return Some((taxid.to_string(), rank.to_string()));
+    }
+
+    let lineage = taxonomy.lineage(taxid);
+    for (ancestor_taxid, ancestor_rank, _) in lineage.iter().rev() {
+        if *ancestor_taxid == taxid {
+            continue;
+        }
+        if ancestor_rank.eq_ignore_ascii_case("no rank") {
+            continue;
+        }
+        if sample.rank_index(ancestor_rank).is_some() {
+            return Some((ancestor_taxid.to_string(), ancestor_rank.clone()));
+        }
+    }
+
+    None
 }
 
 fn open_reader(input: Option<&PathBuf>) -> Result<Box<dyn BufRead>> {
