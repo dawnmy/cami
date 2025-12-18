@@ -39,11 +39,14 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: macos-14
             target: aarch64-apple-darwin
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Verify Cargo.lock is up to date
+        run: cargo metadata --locked --format-version=1 --no-deps > /dev/null
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
