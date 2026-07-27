@@ -57,29 +57,11 @@ pub fn run(cfg: &ConvertConfig) -> Result<()> {
     }
 
     let scale = if cfg.input_is_percent { 1.0 } else { 100.0 };
-    let total: f64 = records
-        .iter()
-        .map(|(_, _, abundance)| abundance * scale)
-        .sum();
-    let norm_factor = if cfg.normalize {
-        if total == 0.0 {
-            bail!("cannot normalize because total abundance is zero");
-        }
-        100.0 / total
-    } else {
-        1.0
-    };
-
     let mut aggregated: HashMap<(String, String), f64> = HashMap::new();
     for (taxid_str, taxid_value, abundance) in records {
         let resolved_taxid = match taxonomy.resolve_taxid(taxid_value) {
             Some(value) => value,
-            None => {
-                eprintln!(
-                    "warning: skipping taxid {taxid_str} because it is not present in the taxonomy"
-                );
-                continue;
-            }
+            None => continue,
         };
 
         let mut rank = taxonomy
@@ -99,11 +81,26 @@ pub fn run(cfg: &ConvertConfig) -> Result<()> {
             continue;
         };
 
-        let percentage = abundance * scale * norm_factor;
+        let percentage = abundance * scale;
         aggregated
             .entry((target_taxid, target_rank))
             .and_modify(|value| *value += percentage)
             .or_insert(percentage);
+    }
+
+    if aggregated.is_empty() {
+        bail!("none of the input taxids could be mapped to a CAMI rank");
+    }
+
+    if cfg.normalize {
+        let retained_total: f64 = aggregated.values().sum();
+        if retained_total == 0.0 {
+            bail!("cannot normalize because the mapped abundance total is zero");
+        }
+        let norm_factor = 100.0 / retained_total;
+        for percentage in aggregated.values_mut() {
+            *percentage *= norm_factor;
+        }
     }
 
     let mut aggregated_entries: Vec<_> = aggregated.into_iter().collect();
@@ -173,6 +170,12 @@ fn read_records(cfg: &ConvertConfig) -> Result<Vec<(String, u32, f64)>> {
         let abundance: f64 = abundance_raw
             .parse()
             .with_context(|| format!("parsing abundance on line {}", line_no + 1))?;
+        if !abundance.is_finite() {
+            bail!("abundance on line {} must be finite", line_no + 1);
+        }
+        if abundance < 0.0 {
+            bail!("abundance on line {} cannot be negative", line_no + 1);
+        }
         records.push((taxid_raw.to_string(), taxid_value, abundance));
     }
 
@@ -246,4 +249,128 @@ fn modern_rank_groups() -> Vec<Vec<String>> {
         vec!["species".to_string()],
         vec!["strain".to_string()],
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cami::parse_cami;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct Fixture {
+        dir: PathBuf,
+        input: PathBuf,
+        output: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(input: &str) -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!("camitk-convert-{nonce}"));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("nodes.dmp"),
+                concat!(
+                    "1\t|\t1\t|\tno rank\t|\n",
+                    "2\t|\t1\t|\tsuperkingdom\t|\n",
+                    "10\t|\t2\t|\tgenus\t|\n",
+                    "11\t|\t10\t|\tspecies\t|\n",
+                    "20\t|\t2\t|\tgenus\t|\n",
+                ),
+            )
+            .unwrap();
+            fs::write(
+                dir.join("names.dmp"),
+                concat!(
+                    "1\t|\troot\t|\t\t|\tscientific name\t|\n",
+                    "2\t|\tBacteria\t|\t\t|\tscientific name\t|\n",
+                    "10\t|\tCurrent genus\t|\t\t|\tscientific name\t|\n",
+                    "11\t|\tCurrent species\t|\t\t|\tscientific name\t|\n",
+                    "20\t|\tGenus only\t|\t\t|\tscientific name\t|\n",
+                ),
+            )
+            .unwrap();
+            fs::write(dir.join("merged.dmp"), "99\t|\t11\t|\n").unwrap();
+            fs::write(dir.join("delnodes.dmp"), "").unwrap();
+            let input_path = dir.join("input.tsv");
+            let output = dir.join("output.cami");
+            fs::write(&input_path, input).unwrap();
+            Self {
+                dir,
+                input: input_path,
+                output,
+            }
+        }
+
+        fn run(&self, normalize: bool) -> Result<Sample> {
+            run(&ConvertConfig {
+                input: Some(&self.input),
+                output: Some(&self.output),
+                taxid_column: 1,
+                abundance_column: 2,
+                input_is_percent: true,
+                normalize,
+                sample_id: "test",
+                dmp_dir: Some(&self.dir),
+                taxonomy_tag: None,
+            })?;
+            Ok(parse_cami(&self.output)?.remove(0))
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn rank_total(sample: &Sample, rank: &str) -> f64 {
+        sample
+            .entries
+            .iter()
+            .filter(|entry| entry.rank == rank)
+            .map(|entry| entry.percentage)
+            .sum()
+    }
+
+    #[test]
+    fn mixed_ranks_use_current_dump_ids_names_and_expected_totals() {
+        let fixture = Fixture::new("taxid\tabundance\n99\t90\n20\t10\n");
+        let sample = fixture.run(false).unwrap();
+
+        assert_eq!(rank_total(&sample, "species"), 90.0);
+        assert_eq!(rank_total(&sample, "genus"), 100.0);
+        let species = sample
+            .entries
+            .iter()
+            .find(|entry| entry.rank == "species")
+            .unwrap();
+        assert_eq!(species.taxid, "11");
+        assert!(species.taxpathsn.ends_with("Current genus|Current species"));
+    }
+
+    #[test]
+    fn normalization_excludes_taxids_that_cannot_be_mapped() {
+        let fixture = Fixture::new("11\t50\n777\t50\n");
+        let sample = fixture.run(true).unwrap();
+
+        assert_eq!(rank_total(&sample, "species"), 100.0);
+        assert_eq!(rank_total(&sample, "genus"), 100.0);
+    }
+
+    #[test]
+    fn rejects_non_finite_and_negative_abundances() {
+        for abundance in ["NaN", "inf", "-1"] {
+            let fixture = Fixture::new(&format!("11\t{abundance}\n"));
+            let error = fixture.run(false).unwrap_err().to_string();
+            assert!(
+                error.contains("must be finite") || error.contains("cannot be negative"),
+                "unexpected error: {error}"
+            );
+        }
+    }
 }
