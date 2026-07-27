@@ -113,7 +113,16 @@ pub fn fill_up_to(
             }
         }
 
-        let mut new_entries: Vec<Entry> = Vec::new();
+        let mut new_entries: Vec<Entry> = sample
+            .entries
+            .iter()
+            .filter(|entry| {
+                sample
+                    .rank_index(&entry.rank)
+                    .is_none_or(|idx| idx < start_idx || idx > end_idx)
+            })
+            .cloned()
+            .collect();
         for idx in 0..sample.ranks.len() {
             if idx < start_idx || idx > end_idx {
                 continue;
@@ -340,6 +349,8 @@ fn build_paths(sample: &Sample, rank_map: &RankMap, upto_idx: usize) -> (String,
 mod tests {
     use super::*;
     use crate::cami::Sample;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn build_paths_includes_placeholders_for_missing_ranks() {
@@ -388,5 +399,82 @@ mod tests {
 
         assert_eq!(taxpath, "131567|2759||5794");
         assert_eq!(taxpathsn, "cellular organisms|Eukaryota||Apicomplexa");
+    }
+
+    #[test]
+    fn fill_up_preserves_entries_outside_requested_rank_range() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("camitk-fillup-{nonce}"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("nodes.dmp"),
+            concat!(
+                "1\t|\t1\t|\tno rank\t|\n",
+                "2\t|\t1\t|\tsuperkingdom\t|\n",
+                "10\t|\t2\t|\tgenus\t|\n",
+                "11\t|\t10\t|\tspecies\t|\n",
+                "12\t|\t11\t|\tno rank\t|\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("names.dmp"),
+            concat!(
+                "1\t|\troot\t|\t\t|\tscientific name\t|\n",
+                "2\t|\tBacteria\t|\t\t|\tscientific name\t|\n",
+                "10\t|\tGenus\t|\t\t|\tscientific name\t|\n",
+                "11\t|\tSpecies\t|\t\t|\tscientific name\t|\n",
+                "12\t|\tStrain\t|\t\t|\tscientific name\t|\n",
+            ),
+        )
+        .unwrap();
+        let taxonomy = Taxonomy::load(&dir).unwrap();
+        let mut sample = Sample {
+            id: "sample".to_string(),
+            version: None,
+            taxonomy_tag: None,
+            ranks: Vec::new(),
+            rank_groups: Vec::new(),
+            rank_aliases: HashMap::new(),
+            entries: Vec::new(),
+        };
+        sample.set_rank_groups(vec![
+            vec!["superkingdom".to_string()],
+            vec!["genus".to_string()],
+            vec!["species".to_string()],
+            vec!["strain".to_string()],
+        ]);
+        for (taxid, rank) in [("2", "superkingdom"), ("11", "species"), ("12", "strain")] {
+            sample.entries.push(Entry {
+                taxid: taxid.to_string(),
+                rank: rank.to_string(),
+                taxpath: taxid.to_string(),
+                taxpathsn: rank.to_string(),
+                percentage: 100.0,
+                cami_genome_id: None,
+                cami_otu: None,
+                hosts: None,
+            });
+        }
+
+        fill_up_to(
+            std::slice::from_mut(&mut sample),
+            Some("species"),
+            "genus",
+            &taxonomy,
+        );
+
+        assert!(
+            sample
+                .entries
+                .iter()
+                .any(|entry| entry.rank == "superkingdom")
+        );
+        assert!(sample.entries.iter().any(|entry| entry.rank == "strain"));
+        assert!(sample.entries.iter().any(|entry| entry.rank == "genus"));
+        fs::remove_dir_all(dir).unwrap();
     }
 }

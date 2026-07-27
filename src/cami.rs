@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
@@ -102,8 +102,9 @@ pub fn parse_cami_reader<R: BufRead>(reader: R) -> Result<Vec<Sample>> {
     let mut samples = Vec::new();
     let mut current: Option<Sample> = None;
 
-    for line in reader.lines() {
-        let line = line?;
+    for (line_index, line) in reader.lines().enumerate() {
+        let line_number = line_index + 1;
+        let line = line.with_context(|| format!("reading CAMI line {line_number}"))?;
         let line = line.trim_end();
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -159,7 +160,7 @@ pub fn parse_cami_reader<R: BufRead>(reader: R) -> Result<Vec<Sample>> {
             } else {
                 let fields_ws: Vec<&str> = line.split_whitespace().collect();
                 if fields_ws.len() < 5 {
-                    continue;
+                    bail!("CAMI data row on line {line_number} has fewer than 5 columns");
                 }
                 (
                     fields_ws[0],
@@ -174,17 +175,25 @@ pub fn parse_cami_reader<R: BufRead>(reader: R) -> Result<Vec<Sample>> {
             };
 
         if let Some(s) = current.as_mut() {
+            let percentage = percentage
+                .parse::<f64>()
+                .with_context(|| format!("parsing PERCENTAGE on CAMI line {line_number}"))?;
+            if !percentage.is_finite() || percentage < 0.0 {
+                bail!("PERCENTAGE on CAMI line {line_number} must be finite and non-negative");
+            }
             let entry = Entry {
                 taxid: taxid.to_string(),
                 rank: rank.to_string(),
                 taxpath: taxpath.to_string(),
                 taxpathsn: taxpathsn.to_string(),
-                percentage: percentage.parse().unwrap_or(0.0),
+                percentage,
                 cami_genome_id: cami_genome_id.map(|v| v.to_string()),
                 cami_otu: cami_otu.map(|v| v.to_string()),
                 hosts: hosts.map(|v| v.to_string()),
             };
             s.entries.push(entry);
+        } else {
+            bail!("CAMI data row on line {line_number} appears before @SampleID");
         }
     }
 
@@ -268,4 +277,25 @@ pub fn open_output(path: Option<&PathBuf>) -> Result<Box<dyn Write>> {
         _ => Box::new(io::stdout()),
     };
     Ok(writer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_cami_reader;
+    use std::io::Cursor;
+
+    #[test]
+    fn parser_rejects_invalid_percentages_instead_of_turning_them_into_zero() {
+        for percentage in ["not-a-number", "NaN", "inf", "-1"] {
+            let input =
+                format!("@SampleID:test\n@Ranks:species\n1\tspecies\t1\tname\t{percentage}\n");
+            assert!(parse_cami_reader(Cursor::new(input)).is_err());
+        }
+    }
+
+    #[test]
+    fn parser_reports_truncated_rows_and_rows_before_a_sample() {
+        assert!(parse_cami_reader(Cursor::new("@SampleID:test\n1\tspecies\n")).is_err());
+        assert!(parse_cami_reader(Cursor::new("1\tspecies\t1\tname\t10\n")).is_err());
+    }
 }

@@ -118,6 +118,10 @@ Turn a simple TSV of taxonomic abundances into a fully fledged CAMI profile. The
 
 If the first line of the TSV contains headers, the command automatically skips it as long as the taxid and abundance fields cannot be parsed as numbers. Abundance values are written to the CAMI file exactly as provided, so ensure your TSV reports percentages (multiply fractions by 100 before converting).
 
+Input rows may belong to different taxonomic ranks. During lineage filling, abundance assigned at a more specific rank is propagated to its ancestors, while abundance assigned only to an ancestor is not copied down to more specific ranks. For example, if species rows total 90% and genus-only rows total 10%, the converted profile totals 90% at species and 100% at genus (the 90% propagated from species plus the 10% assigned directly to genus). Thus a rank does not have to total 100%; `--norm` normalizes all successfully mapped input rows as a whole, not every output rank independently. Use `camitk renorm` only when each rank should be rescaled separately to 100%.
+
+Taxids, ranks, lineage taxids, and scientific names in the output come from the selected dump directory. If an input taxid appears in `merged.dmp`, `convert` writes its current replacement taxid and name and prints a warning. Deleted, unknown, and otherwise unmappable taxids are warned about and omitted; when `--norm` is used, normalization is calculated after those rows have been omitted.
+
 Key options:
 
 - `-i, --taxid-column <INDEX>` – 1-based column holding NCBI taxids. Defaults to `1`. Use this when the taxid column is not the first field (e.g., `-i 3` to read from the third column).

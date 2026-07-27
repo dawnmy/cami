@@ -307,8 +307,9 @@ fn build_profile_map(
             if entry.percentage <= 0.0 {
                 continue;
             }
+            let rank_name = canonical_rank(&entry.rank).unwrap_or_else(|_| entry.rank.clone());
             if let Some(filter) = &rank_filter {
-                if !filter.contains(&entry.rank) {
+                if !filter.contains(&rank_name) {
                     continue;
                 }
             }
@@ -317,7 +318,6 @@ fn build_profile_map(
                     continue;
                 }
             }
-            let rank_name = canonical_rank(&entry.rank).unwrap_or_else(|_| entry.rank.clone());
             let cache_key = lineage_cache_key(entry, &rank_name);
             let lineage = lineage_cache
                 .entry(cache_key)
@@ -581,7 +581,7 @@ fn compute_metrics(
             entry.taxid
         );
         if entry.percentage > 0.0 {
-            gt_map.insert(entry.taxid.clone(), entry.percentage);
+            *gt_map.entry(entry.taxid.clone()).or_insert(0.0) += entry.percentage;
         }
     }
     let mut pred_map: HashMap<String, f64> = HashMap::new();
@@ -597,7 +597,7 @@ fn compute_metrics(
             entry.taxid
         );
         if entry.percentage > 0.0 {
-            pred_map.insert(entry.taxid.clone(), entry.percentage);
+            *pred_map.entry(entry.taxid.clone()).or_insert(0.0) += entry.percentage;
         }
     }
 
@@ -1839,10 +1839,10 @@ fn format_float(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CANONICAL_RANKS, LineageInfo, ProfileEntry, abundance_rank_error, canonical_rank_index,
-        compute_lineage, ensure_superkingdom_only, entry_belongs_to_domain,
-        entry_missing_superkingdom, highest_taxid_in_taxpath, mass_weighted_abundance_rank_error,
-        samples_need_superkingdom, unifrac, unifrac_components,
+        CANONICAL_RANKS, LineageInfo, ProfileEntry, abundance_rank_error, build_profile_map,
+        canonical_rank_index, compute_lineage, compute_metrics, ensure_superkingdom_only,
+        entry_belongs_to_domain, entry_missing_superkingdom, highest_taxid_in_taxpath,
+        mass_weighted_abundance_rank_error, samples_need_superkingdom, unifrac, unifrac_components,
     };
     use crate::cami::{Entry, Sample};
     use crate::taxonomy::Taxonomy;
@@ -1984,6 +1984,53 @@ mod tests {
             percentage,
             lineage,
         }
+    }
+
+    #[test]
+    fn metrics_sum_duplicate_taxids_consistently() {
+        let gt = vec![
+            profile_entry_for_test("2|10", 25.0),
+            profile_entry_for_test("2|10", 25.0),
+        ];
+        let pred = vec![profile_entry_for_test("2|10", 50.0)];
+
+        let metrics = compute_metrics("phylum", &gt, &pred).unwrap();
+        assert_eq!((metrics.tp, metrics.fp, metrics.fn_), (1, 0, 0));
+        assert!((metrics.l1_error - 0.0).abs() < 1e-12);
+        assert_eq!(metrics.abundance_rank_error, Some(0.0));
+    }
+
+    #[test]
+    fn rank_filter_matches_canonical_rank_aliases() {
+        let mut sample = Sample {
+            id: "sample".to_string(),
+            version: None,
+            taxonomy_tag: None,
+            ranks: Vec::new(),
+            rank_groups: Vec::new(),
+            rank_aliases: HashMap::new(),
+            entries: vec![Entry {
+                taxid: "2".to_string(),
+                rank: "domain".to_string(),
+                taxpath: "2".to_string(),
+                taxpathsn: "Bacteria".to_string(),
+                percentage: 100.0,
+                cami_genome_id: None,
+                cami_otu: None,
+                hosts: None,
+            }],
+        };
+        sample.set_rank_groups(vec![vec!["domain".to_string()]]);
+
+        let profiles = build_profile_map(
+            &[sample],
+            Some(&vec!["superkingdom".to_string()]),
+            false,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(profiles["sample"]["superkingdom"].len(), 1);
     }
 
     #[test]

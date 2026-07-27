@@ -20,6 +20,9 @@ pub fn run(cfg: &PreviewConfig) -> Result<()> {
         if !rank_tokens.is_empty() {
             writeln!(out, "@Ranks:{}", rank_tokens.join("|"))?;
         }
+        if let Some(taxonomy_tag) = &sample.taxonomy_tag {
+            writeln!(out, "@TaxonomyID:{}", taxonomy_tag)?;
+        }
         let extended = sample.is_modern_format()
             || sample
                 .entries
